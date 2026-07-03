@@ -828,6 +828,146 @@ app.post('/splits/:splitId/shares/:shareId/pay', (req, res) => {
     return res.status(statusCode).json({ error: err.message || 'Could not pay this share' });
   }
 });
+// ================== TRANSACTION IMPORT & ANALYTICS (Feature 5) ==================
+
+// ---------- POST /import/transactions ----------
+// Body: { account_id, csv_data } where csv_data is the raw CSV string
+// Expected CSV columns: date, merchant, amount (minimum required)
+app.post('/import/transactions', (req, res) => {
+  const { account_id, csv_data } = req.body;
+
+  if (!account_id || !csv_data) {
+    return res.status(400).json({ error: 'account_id and csv_data are required' });
+  }
+
+  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(account_id);
+  if (!account) {
+    return res.status(404).json({ error: 'Account not found' });
+  }
+
+  const lines = csv_data.trim().split('\n');
+  if (lines.length < 2) {
+    return res.status(400).json({ error: 'CSV must have a header and at least one data row' });
+  }
+
+  // Parse header
+  const header = lines[0].split(',').map(h => h.trim().toLowerCase());
+  const dateIdx = header.indexOf('date');
+  const merchantIdx = header.indexOf('merchant');
+  const amountIdx = header.indexOf('amount');
+
+  if (dateIdx === -1 || merchantIdx === -1 || amountIdx === -1) {
+    return res.status(400).json({ error: 'CSV must have "date", "merchant", and "amount" columns' });
+  }
+
+  const imported = [];
+  const errors = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    const cols = line.split(',').map(c => c.trim());
+    const txDate = cols[dateIdx];
+    const merchant = cols[merchantIdx];
+    const amountStr = cols[amountIdx];
+
+    if (!txDate || !merchant || !amountStr) {
+      errors.push(`Row ${i + 1}: missing required fields`);
+      continue;
+    }
+
+    const amountCents = Math.round(Number(amountStr) * 100);
+    if (!Number.isFinite(amountCents) || amountCents <= 0) {
+      errors.push(`Row ${i + 1}: invalid amount "${amountStr}"`);
+      continue;
+    }
+
+    try {
+      const txId = uuidv4();
+      const timestamp = new Date(txDate).toISOString();
+      if (isNaN(new Date(timestamp).getTime())) {
+        errors.push(`Row ${i + 1}: invalid date "${txDate}"`);
+        continue;
+      }
+
+      db.prepare(`
+        INSERT INTO transactions
+          (id, idempotency_key, from_account_id, to_account_id, amount_cents, status, created_at, updated_at, merchant)
+        VALUES (?, ?, ?, ?, ?, 'SUCCESS', ?, ?, ?)
+      `).run(
+        txId,
+        `import_${account_id}_${i}_${Date.now()}`,
+        account_id,
+        account_id, // to_account_id = same account (import, not transfer)
+        amountCents,
+        timestamp,
+        timestamp,
+        merchant
+      );
+
+      imported.push({ date: txDate, merchant, amount: amountCents / 100 });
+    } catch (err) {
+      errors.push(`Row ${i + 1}: ${err.message}`);
+    }
+  }
+
+  return res.status(200).json({
+    imported: imported.length,
+    errors,
+    data: imported
+  });
+});
+
+// ---------- GET /analytics/spending?account_id=X&month=YYYY-MM ----------
+// Returns total spending by merchant for a given month
+app.get('/analytics/spending', (req, res) => {
+  const { account_id, month } = req.query;
+
+  if (!account_id) {
+    return res.status(400).json({ error: 'account_id is required' });
+  }
+
+  let monthPrefix = currentMonthPrefix();
+  if (month !== undefined) {
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
+      return res.status(400).json({ error: 'month must be in YYYY-MM format' });
+    }
+    monthPrefix = month;
+  }
+
+  const rows = db.prepare(`
+    SELECT merchant, SUM(amount_cents) AS total, COUNT(*) AS count
+    FROM transactions
+    WHERE from_account_id = ? AND created_at LIKE ? AND status = 'SUCCESS'
+    GROUP BY merchant
+    ORDER BY total DESC
+  `).all(account_id, `${monthPrefix}%`);
+
+  const data = rows.map(r => ({
+    merchant: r.merchant || 'Uncategorized',
+    total: r.total / 100,
+    count: r.count
+  }));
+
+  const grandTotal = data.reduce((sum, d) => sum + d.total, 0);
+
+  return res.json({
+    month: monthPrefix,
+    total_spending: grandTotal,
+    by_merchant: data
+  });
+});
+// ---------- DELETE /transactions/:id ----------
+app.delete('/transactions/:id', (req, res) => {
+  const { id } = req.params;
+  const existing = db.prepare('SELECT * FROM transactions WHERE id = ?').get(id);
+  if (!existing) {
+    return res.status(404).json({ error: 'Transaction not found' });
+  }
+  db.prepare('DELETE FROM transactions WHERE id = ?').run(id);
+  return res.status(200).json({ deleted: true, id });
+});
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 

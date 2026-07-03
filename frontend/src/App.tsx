@@ -1639,42 +1639,152 @@ function App() {
                   <span className={`amount ${isOutgoing ? 'debit' : 'credit'}`}>
                     {isOutgoing ? '−' : '+'}${formatMoney(tx.amount)}
                   </span>
-                  <span>
-                    {isEditing ? (
-                      <div style={{ display: 'flex', gap: 6 }}>
-                        <button
-                          type="button"
-                          className="send-btn"
-                          style={{ padding: '4px 10px', fontSize: '0.8rem' }}
-                          disabled={savingEdit}
-                          onClick={() => handleSaveEditTx(tx.id)}
-                        >
-                          {savingEdit ? 'Saving…' : 'Save'}
-                        </button>
-                        <button
-                          type="button"
-                          style={{ padding: '4px 10px', fontSize: '0.8rem', background: '#eee', border: 'none', borderRadius: 6, cursor: 'pointer' }}
-                          onClick={() => setEditingTxId(null)}
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    ) : (
-                      <button
-                        type="button"
-                        style={{ padding: '4px 10px', fontSize: '0.8rem', background: '#eee', border: 'none', borderRadius: 6, cursor: 'pointer' }}
-                        onClick={() => startEditTx(tx)}
-                      >
-                        Edit
-                      </button>
-                    )}
-                  </span>
+               <span>
+  {isEditing ? (
+    <div style={{ display: 'flex', gap: 6 }}>
+      <button
+        type="button"
+        className="send-btn"
+        style={{ padding: '4px 10px', fontSize: '0.8rem' }}
+        disabled={savingEdit}
+        onClick={() => handleSaveEditTx(tx.id)}
+      >
+        {savingEdit ? 'Saving…' : 'Save'}
+      </button>
+      <button
+        type="button"
+        style={{ padding: '4px 10px', fontSize: '0.8rem', background: '#eee', border: 'none', borderRadius: 6, cursor: 'pointer' }}
+        onClick={() => setEditingTxId(null)}
+      >
+        Cancel
+      </button>
+    </div>
+  ) : (
+    <div style={{ display: 'flex', gap: 6 }}>
+      <button
+        type="button"
+        style={{ padding: '4px 10px', fontSize: '0.8rem', background: '#eee', border: 'none', borderRadius: 6, cursor: 'pointer' }}
+        onClick={() => startEditTx(tx)}
+      >
+        Edit
+      </button>
+      <button
+        type="button"
+        style={{ padding: '4px 10px', fontSize: '0.8rem', background: '#d9887e', color: '#b03a2e', border: 'none', borderRadius: 6, cursor: 'pointer' }}
+        onClick={async () => {
+          try {
+            const res = await fetch(`${API_BASE}/transactions/${tx.id}`, { method: 'DELETE' });
+            if (res.ok) {
+              await runTransactionSearch();
+            } else {
+              setTmMessage({ type: 'error', text: 'Could not delete transaction.' });
+            }
+          } catch {
+            setTmMessage({ type: 'error', text: 'Could not reach server.' });
+          }
+        }}
+      >
+        Delete
+      </button>
+    </div>
+  )}
+</span>
+                  
                 </div>
               )
             })}
           </div>
         )}
       </section>
+      <section className="ledger-section" style={{ marginTop: 24 }}>
+    <h2>Import transactions</h2>
+    <p style={{ color: '#666', fontSize: '0.9rem', marginTop: -8, marginBottom: 16 }}>
+      Paste CSV data with columns: <strong>date, merchant, amount</strong>. Dates should be ISO format (2026-07-03).
+    </p>
+<form onSubmit={async (e) => {
+  e.preventDefault();
+  const csvData = (e.currentTarget.elements.namedItem('csv-data') as HTMLTextAreaElement)?.value || '';
+  if (!csvData.trim()) {
+    setTmMessage({ type: 'error', text: 'Paste CSV data first.' });
+    return;
+  }
+  
+  const targetAccountId = activeAccountId;
+  if (!targetAccountId) {
+    setTmMessage({ type: 'error', text: 'No account selected.' });
+    return;
+  }
+  
+  try {
+    const res = await fetch(`${API_BASE}/import/transactions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ account_id: targetAccountId, csv_data: csvData })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setTmMessage({ type: 'error', text: data.error || 'Import failed' });
+    } else {
+      setTmMessage({ type: 'success', text: `Imported ${data.imported} transactions${data.errors.length > 0 ? ` (${data.errors.length} errors)` : '.'}` });
+      (e.currentTarget.elements.namedItem('csv-data') as HTMLTextAreaElement).value = '';
+      await loadData(targetAccountId);
+      runTransactionSearch();
+      setCompareRefreshKey(k => k + 1);
+    }
+  } catch {
+    setTmMessage({ type: 'error', text: 'Could not reach server.' });
+  }
+}}>
+      <textarea
+        name="csv-data"
+        placeholder="date,merchant,amount&#10;2026-07-01,Starbucks,5.50&#10;2026-07-02,Amazon,29.99"
+        style={{ width: '100%', height: 120, fontFamily: 'monospace', padding: 10, borderRadius: 6, border: '1px solid #ddd', marginBottom: 12 }}
+      />
+      <button className="send-btn" type="submit">Import CSV</button>
+      {tmMessage && <div className={`form-message ${tmMessage.type}`}>{tmMessage.text}</div>}
+    </form>
+  </section>
+
+  <section className="ledger-section" style={{ marginTop: 24 }}>
+    <h2>Spending by merchant</h2>
+    <div style={{ display: 'flex', gap: 12, marginBottom: 16 }}>
+      <div className="field" style={{ flex: 1, minWidth: 180 }}>
+        <label htmlFor="analytics-month">Month</label>
+        <input
+          id="analytics-month"
+          type="month"
+          defaultValue={currentMonthValue()}
+          onChange={async (e) => {
+            const month = e.currentTarget.value;
+            try {
+              const res = await fetch(`${API_BASE}/analytics/spending?account_id=${activeAccountId}&month=${month}`);
+              const data = await res.json();
+              if (res.ok) {
+                const total = data.total_spending;
+                const html = data.by_merchant.length === 0
+                  ? '<div class="empty-state">No spending this month.</div>'
+                  : `<div style="display:flex;flex-direction:column;gap:12px;">${data.by_merchant.map((m: any) => `
+                    <div style="padding:10px 14px;border:1px solid #e5e1d8;border-radius:8px;">
+                      <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                        <strong>${m.merchant}</strong>
+                        <span>$${m.total.toFixed(2)} (${m.count}x)</span>
+                      </div>
+                      <div style="background:#eee;border-radius:4px;height:8px;">
+                        <div style="width:${(m.total/total)*100}%;background:#2f7a4f;height:100%;"></div>
+                      </div>
+                    </div>
+                  `).join('')}</div>`;
+                document.getElementById('analytics-results')!.innerHTML = html;
+              }
+            } catch {
+              document.getElementById('analytics-results')!.innerHTML = '<div class="empty-state">Could not load data.</div>';
+            }
+          }}
+        />
+      </div>
+    </div>
+    <div id="analytics-results" className="empty-state">Select a month to see data.</div>
+  </section>
     </>
   )
 }
