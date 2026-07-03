@@ -208,10 +208,12 @@ const [newAccountPin, setNewAccountPin] = useState('')
     setAccounts(accData)
     setTransactions(txData)
     setActiveAccountId(prev => {
-      if (preferAccountId) return preferAccountId
-      if (prev && accData.some(a => a.id === prev)) return prev
-      return accData.find(a => a.is_active)?.id ?? accData[0]?.id ?? ''
-    })
+  if (preferAccountId) return preferAccountId
+  if (prev && accData.some(a => a.id === prev)) return prev
+  const saved = localStorage.getItem('activeAccountId')
+  if (saved && accData.some(a => a.id === saved)) return saved
+  return accData.find(a => a.is_active)?.id ?? accData[0]?.id ?? ''
+})
   }, [])
 
   const loadBudgetingData = useCallback(async (accountId: string) => {
@@ -361,6 +363,11 @@ const [newAccountPin, setNewAccountPin] = useState('')
       loadSplits(activeAccountId)
     }
   }, [activeAccountId, loadBudgetingData, loadSplits])
+  useEffect(() => {
+  if (activeAccountId) {
+    localStorage.setItem('activeAccountId', activeAccountId)
+  }
+}, [activeAccountId])
 
   const activeAccount = accounts.find(a => a.id === activeAccountId)
 

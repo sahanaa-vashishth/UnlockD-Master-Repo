@@ -8,7 +8,7 @@
     "dev": "node server.js"
   },
   "dependencies": {
-    "better-sqlite3": "^11.3.0",
+    "pg": "^8.13.1",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "uuid": "^9.0.1"

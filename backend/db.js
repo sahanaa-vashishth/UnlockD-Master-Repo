@@ -1,174 +1,108 @@
-const Database = require('better-sqlite3');
-const path = require('path');
+const { Pool } = require('pg');
 
-// File-based DB so data survives container restarts (stored in a docker volume if you add one).
-const db = new Database(path.join(__dirname, 'data.sqlite'));
+// Connection comes from environment variables (set in docker-compose.yml).
+// Falls back to sensible local defaults if not provided.
+const pool = new Pool({
+  host: process.env.PGHOST || 'localhost',
+  port: process.env.PGPORT ? Number(process.env.PGPORT) : 5432,
+  user: process.env.PGUSER || 'postgres',
+  password: process.env.PGPASSWORD || 'postgres',
+  database: process.env.PGDATABASE || 'unlockd',
+});
 
-db.pragma('journal_mode = WAL');
+async function init() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS accounts (
+      id TEXT PRIMARY KEY,
+      owner_name TEXT NOT NULL,
+      balance_cents INTEGER NOT NULL DEFAULT 0,
+      savings_balance_cents INTEGER NOT NULL DEFAULT 0,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      pin TEXT NOT NULL DEFAULT '0000'
+    );
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS accounts (
-    id TEXT PRIMARY KEY,
-    owner_name TEXT NOT NULL,
-    balance_cents INTEGER NOT NULL DEFAULT 0,
-    savings_balance_cents INTEGER NOT NULL DEFAULT 0,
-    is_active INTEGER NOT NULL DEFAULT 1
-  );
+    CREATE TABLE IF NOT EXISTS transactions (
+      id TEXT PRIMARY KEY,
+      idempotency_key TEXT UNIQUE NOT NULL,
+      from_account_id TEXT NOT NULL,
+      to_account_id TEXT NOT NULL,
+      amount_cents INTEGER NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('PENDING','SUCCESS','FAILED')),
+      failure_reason TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      category TEXT,
+      description TEXT,
+      merchant TEXT
+    );
 
-  CREATE TABLE IF NOT EXISTS transactions (
-    id TEXT PRIMARY KEY,
-    idempotency_key TEXT UNIQUE NOT NULL,
-    from_account_id TEXT NOT NULL,
-    to_account_id TEXT NOT NULL,
-    amount_cents INTEGER NOT NULL,
-    status TEXT NOT NULL CHECK(status IN ('PENDING','SUCCESS','FAILED')),
-    failure_reason TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
+    CREATE TABLE IF NOT EXISTS expenses (
+      id TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL,
+      category TEXT NOT NULL,
+      amount_cents INTEGER NOT NULL,
+      payee TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
 
-  -- Spending categories are free text (defaults: Food, Entertainment, Miscellaneous,
-  -- plus anything custom the user names, e.g. "Dream Vacation", "TV"). Validated in
-  -- server.js instead of a DB-level CHECK, so new category names never require a migration.
-  -- Savings moves through savings_transactions instead (it's a two-way pot, not pure spend).
-  CREATE TABLE IF NOT EXISTS expenses (
-    id TEXT PRIMARY KEY,
-    account_id TEXT NOT NULL,
-    category TEXT NOT NULL,
-    amount_cents INTEGER NOT NULL,
-    payee TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
+    CREATE TABLE IF NOT EXISTS budgets (
+      id TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL,
+      category TEXT NOT NULL,
+      monthly_limit_cents INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(account_id, category)
+    );
 
-  -- One row per account+category. monthly_limit_cents is a recurring cap —
-  -- utilization is always computed fresh from the current calendar month's
-  -- expenses/savings activity, so budgets "reset" automatically with no cron job.
-  -- category is free text; 'Savings' is the one reserved name tracked via
-  -- savings_transactions instead of the expenses table.
-  CREATE TABLE IF NOT EXISTS budgets (
-    id TEXT PRIMARY KEY,
-    account_id TEXT NOT NULL,
-    category TEXT NOT NULL,
-    monthly_limit_cents INTEGER NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE(account_id, category)
-  );
+    CREATE TABLE IF NOT EXISTS savings_transactions (
+      id TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL,
+      type TEXT NOT NULL CHECK(type IN ('CONTRIBUTE','WITHDRAW')),
+      amount_cents INTEGER NOT NULL,
+      created_at TEXT NOT NULL
+    );
 
-  -- Savings is a sub-pot of the account: CONTRIBUTE moves money from main
-  -- balance into savings, WITHDRAW moves it back out (e.g. for emergencies).
-  CREATE TABLE IF NOT EXISTS savings_transactions (
-    id TEXT PRIMARY KEY,
-    account_id TEXT NOT NULL,
-    type TEXT NOT NULL CHECK(type IN ('CONTRIBUTE','WITHDRAW')),
-    amount_cents INTEGER NOT NULL,
-    created_at TEXT NOT NULL
-  );
+    CREATE TABLE IF NOT EXISTS splits (
+      id TEXT PRIMARY KEY,
+      creator_account_id TEXT NOT NULL,
+      category TEXT NOT NULL,
+      payee TEXT NOT NULL,
+      total_cents INTEGER NOT NULL,
+      split_type TEXT NOT NULL CHECK(split_type IN ('EQUAL','CUSTOM')),
+      created_at TEXT NOT NULL
+    );
 
-  -- Feature 3: Split a bill.
-  -- A split is a "template" — total amount, category, who was paid (shopkeeper,
-  -- cab driver, etc.), split type, and who created it. Each participant (including
-  -- the creator) gets their own independent share row below. There are NO internal
-  -- transfers between participants — each share simply becomes that person's own
-  -- expense (hitting their own budget) once they pay it.
-  CREATE TABLE IF NOT EXISTS splits (
-    id TEXT PRIMARY KEY,
-    creator_account_id TEXT NOT NULL,
-    category TEXT NOT NULL,
-    payee TEXT NOT NULL,
-    total_cents INTEGER NOT NULL,
-    split_type TEXT NOT NULL CHECK(split_type IN ('EQUAL','CUSTOM')),
-    created_at TEXT NOT NULL
-  );
+    CREATE TABLE IF NOT EXISTS split_shares (
+      id TEXT PRIMARY KEY,
+      split_id TEXT NOT NULL REFERENCES splits(id),
+      account_id TEXT NOT NULL,
+      amount_cents INTEGER NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('PENDING','PAID')) DEFAULT 'PENDING',
+      expense_id TEXT,
+      created_at TEXT NOT NULL
+    );
+  `);
 
-  -- One row per participant per split (creator included). status flips
-  -- PENDING -> PAID when that person logs their own expense for their share.
-  -- expense_id links to the resulting expenses row once paid, so it's easy to
-  -- trace and stays fully consistent with normal budget tracking.
-  CREATE TABLE IF NOT EXISTS split_shares (
-    id TEXT PRIMARY KEY,
-    split_id TEXT NOT NULL,
-    account_id TEXT NOT NULL,
-    amount_cents INTEGER NOT NULL,
-    status TEXT NOT NULL CHECK(status IN ('PENDING','PAID')) DEFAULT 'PENDING',
-    expense_id TEXT,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY (split_id) REFERENCES splits(id)
-  );
-`);
+  // Idempotent "migrations" — Postgres supports IF NOT EXISTS on ADD COLUMN,
+  // so no need for the PRAGMA-based checks SQLite required.
+  await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS is_active INTEGER NOT NULL DEFAULT 1;`);
+  await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS savings_balance_cents INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS pin TEXT NOT NULL DEFAULT '0000';`);
+  await pool.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS category TEXT;`);
+  await pool.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS description TEXT;`);
+  await pool.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS merchant TEXT;`);
 
-// ---- Migrations for anyone upgrading an existing data.sqlite from earlier features ----
-const accountCols = db.prepare("PRAGMA table_info(accounts)").all();
-if (!accountCols.some(c => c.name === 'is_active')) {
-  db.exec('ALTER TABLE accounts ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1');
-}
-if (!accountCols.some(c => c.name === 'savings_balance_cents')) {
-  db.exec('ALTER TABLE accounts ADD COLUMN savings_balance_cents INTEGER NOT NULL DEFAULT 0');
-}
-if (!accountCols.some(c => c.name === 'pin')) {
-  db.exec("ALTER TABLE accounts ADD COLUMN pin TEXT NOT NULL DEFAULT '0000'");
-}
-// ---- Feature 4: Transaction Management — search/filter/categorize/edit ----
-const txCols = db.prepare("PRAGMA table_info(transactions)").all();
-if (!txCols.some(c => c.name === 'category')) {
-  db.exec("ALTER TABLE transactions ADD COLUMN category TEXT");
-}
-if (!txCols.some(c => c.name === 'description')) {
-  db.exec("ALTER TABLE transactions ADD COLUMN description TEXT");
-}
-if (!txCols.some(c => c.name === 'merchant')) {
-  db.exec("ALTER TABLE transactions ADD COLUMN merchant TEXT");
-}
-
-
-// SQLite can't drop a CHECK constraint with ALTER TABLE, so if an existing
-// data.sqlite still has the old fixed-category CHECK on expenses/budgets,
-// rebuild those tables without it, copying every row across untouched.
-function dropCategoryCheckIfPresent(table, createSql) {
-  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get(table);
-  if (row && row.sql.includes('CHECK(category')) {
-    db.exec(`
-      ALTER TABLE ${table} RENAME TO ${table}_old_checked;
-      ${createSql}
-      INSERT INTO ${table} SELECT * FROM ${table}_old_checked;
-      DROP TABLE ${table}_old_checked;
-    `);
-    console.log(`Migrated ${table}: removed fixed-category constraint, custom category names now allowed.`);
+  // Seed two demo accounts if empty, so you can test transfers immediately.
+  const { rows } = await pool.query('SELECT COUNT(*)::int AS c FROM accounts');
+  if (rows[0].c === 0) {
+    await pool.query(
+      `INSERT INTO accounts (id, owner_name, balance_cents, savings_balance_cents, is_active, pin)
+       VALUES ($1, $2, $3, 0, 1, '0000'), ($4, $5, $6, 0, 1, '0000')`,
+      ['acc_alice', 'Alice', 100000, 'acc_bob', 'Bob', 50000]
+    );
+    console.log('Seeded demo accounts: acc_alice ($1000), acc_bob ($500)');
   }
 }
 
-dropCategoryCheckIfPresent('expenses', `
-  CREATE TABLE expenses (
-    id TEXT PRIMARY KEY,
-    account_id TEXT NOT NULL,
-    category TEXT NOT NULL,
-    amount_cents INTEGER NOT NULL,
-    payee TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
-`);
-
-dropCategoryCheckIfPresent('budgets', `
-  CREATE TABLE budgets (
-    id TEXT PRIMARY KEY,
-    account_id TEXT NOT NULL,
-    category TEXT NOT NULL,
-    monthly_limit_cents INTEGER NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE(account_id, category)
-  );
-`);
-
-// Seed two demo accounts if empty, so you can test transfers immediately.
-const count = db.prepare('SELECT COUNT(*) AS c FROM accounts').get().c;
-if (count === 0) {
-  const seed = db.prepare(
-    'INSERT INTO accounts (id, owner_name, balance_cents, savings_balance_cents, is_active) VALUES (?, ?, ?, 0, 1)'
-  );
-  seed.run('acc_alice', 'Alice', 100000); // $1000.00
-  seed.run('acc_bob', 'Bob', 50000);      // $500.00
-  console.log('Seeded demo accounts: acc_alice ($1000), acc_bob ($500)');
-}
-
-module.exports = db;
+module.exports = { pool, init };

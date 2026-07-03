@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
-const db = require('./db');
+const { pool, init } = require('./db');
 
 const app = express();
 app.use(cors());
@@ -10,10 +10,6 @@ app.use(express.json());
 const now = () => new Date().toISOString();
 const currentMonthPrefix = () => new Date().toISOString().slice(0, 7); // "2026-07"
 
-// Default suggestions shown in the UI — not a restriction. Any non-empty name
-// is accepted (e.g. "Dream Vacation", "TV"), so budgets/expenses aren't locked
-// to a fixed list. 'Savings' is reserved: it's tracked via savings_transactions,
-// not the expenses table, so it can't be used as a plain spending category.
 const DEFAULT_SPEND_CATEGORIES = ['Food', 'Entertainment', 'Miscellaneous'];
 const RESERVED_CATEGORY = 'Savings';
 
@@ -24,11 +20,14 @@ function normalizeCategory(raw) {
   return trimmed;
 }
 
+// Small helper so every route can just `await q(...)` instead of managing
+// pool.query boilerplate everywhere.
+const q = (text, params) => pool.query(text, params);
+
 // ================== ACCOUNTS ==================
 
-// ---------- GET /accounts ----------
-app.get('/accounts', (req, res) => {
-  const rows = db.prepare('SELECT * FROM accounts').all();
+app.get('/accounts', async (req, res) => {
+  const { rows } = await q('SELECT * FROM accounts');
   res.json(rows.map(a => ({
     id: a.id,
     owner_name: a.owner_name,
@@ -38,9 +37,7 @@ app.get('/accounts', (req, res) => {
   })));
 });
 
-// ---------- POST /accounts ----------
-// Body: { owner_name, starting_balance? }
-app.post('/accounts', (req, res) => {
+app.post('/accounts', async (req, res) => {
   const { owner_name, starting_balance, pin } = req.body;
 
   if (!owner_name || typeof owner_name !== 'string' || !owner_name.trim()) {
@@ -62,8 +59,10 @@ app.post('/accounts', (req, res) => {
 
   const id = 'acc_' + owner_name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_') + '_' + Date.now().toString(36);
 
-  db.prepare('INSERT INTO accounts (id, owner_name, balance_cents, savings_balance_cents, is_active, pin) VALUES (?, ?, ?, 0, 1, ?)')
-    .run(id, owner_name.trim(), startingCents, finalPin);
+  await q(
+    'INSERT INTO accounts (id, owner_name, balance_cents, savings_balance_cents, is_active, pin) VALUES ($1, $2, $3, 0, 1, $4)',
+    [id, owner_name.trim(), startingCents, finalPin]
+  );
 
   return res.status(201).json({
     id,
@@ -74,9 +73,7 @@ app.post('/accounts', (req, res) => {
   });
 });
 
-// ---------- PATCH /accounts/:id/status ----------
-// Body: { is_active: boolean }
-app.patch('/accounts/:id/status', (req, res) => {
+app.patch('/accounts/:id/status', async (req, res) => {
   const { id } = req.params;
   const { is_active } = req.body;
 
@@ -84,14 +81,12 @@ app.patch('/accounts/:id/status', (req, res) => {
     return res.status(400).json({ error: 'is_active must be true or false' });
   }
 
-  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(id);
-  if (!account) {
-    return res.status(404).json({ error: 'Account not found' });
-  }
+  const { rows } = await q('SELECT * FROM accounts WHERE id = $1', [id]);
+  if (!rows[0]) return res.status(404).json({ error: 'Account not found' });
 
-  db.prepare('UPDATE accounts SET is_active = ? WHERE id = ?').run(is_active ? 1 : 0, id);
+  await q('UPDATE accounts SET is_active = $1 WHERE id = $2', [is_active ? 1 : 0, id]);
 
-  const updated = db.prepare('SELECT * FROM accounts WHERE id = ?').get(id);
+  const updated = (await q('SELECT * FROM accounts WHERE id = $1', [id])).rows[0];
   return res.json({
     id: updated.id,
     owner_name: updated.owner_name,
@@ -100,103 +95,99 @@ app.patch('/accounts/:id/status', (req, res) => {
     is_active: !!updated.is_active
   });
 });
-// ---------- POST /accounts/:id/verify-pin ----------
-app.post('/accounts/:id/verify-pin', (req, res) => {
+
+app.post('/accounts/:id/verify-pin', async (req, res) => {
   const { id } = req.params;
   const { pin } = req.body;
 
-  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(id);
-  if (!account) {
-    return res.status(404).json({ error: 'Account not found' });
-  }
+  const { rows } = await q('SELECT * FROM accounts WHERE id = $1', [id]);
+  if (!rows[0]) return res.status(404).json({ error: 'Account not found' });
 
-  const valid = String(pin) === account.pin;
+  const valid = String(pin) === rows[0].pin;
   return res.status(valid ? 200 : 401).json({ valid });
 });
 
-// ---------- PATCH /accounts/:id/pin ----------
-app.patch('/accounts/:id/pin', (req, res) => {
+app.patch('/accounts/:id/pin', async (req, res) => {
   const { id } = req.params;
   const { current_pin, new_pin } = req.body;
 
-  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(id);
-  if (!account) {
-    return res.status(404).json({ error: 'Account not found' });
-  }
-  if (String(current_pin) !== account.pin) {
+  const { rows } = await q('SELECT * FROM accounts WHERE id = $1', [id]);
+  if (!rows[0]) return res.status(404).json({ error: 'Account not found' });
+  if (String(current_pin) !== rows[0].pin) {
     return res.status(401).json({ error: 'Current PIN is incorrect' });
   }
   if (!/^\d{4}$/.test(String(new_pin))) {
     return res.status(400).json({ error: 'New PIN must be exactly 4 digits' });
   }
 
-  db.prepare('UPDATE accounts SET pin = ? WHERE id = ?').run(String(new_pin), id);
+  await q('UPDATE accounts SET pin = $1 WHERE id = $2', [String(new_pin), id]);
   return res.json({ updated: true });
 });
+
 // ================== TRANSACTIONS (Feature 1) ==================
 
-// ---------- GET /transactions ----------
-// Supports Feature 4: search by description/merchant, filter by date range,
-// category, amount range, and account. All params optional and combinable.
 function buildTransactionQuery(query) {
-  const { account_id, q, category, min_amount, max_amount, start_date, end_date } = query;
-
+  const { account_id, q: search, category, min_amount, max_amount, start_date, end_date } = query;
   const clauses = [];
   const params = [];
+  let i = 1;
 
   if (account_id) {
-    clauses.push('(from_account_id = ? OR to_account_id = ?)');
+    clauses.push(`(from_account_id = $${i} OR to_account_id = $${i + 1})`);
     params.push(account_id, account_id);
+    i += 2;
   }
-  if (q && q.trim()) {
-    clauses.push('(description LIKE ? OR merchant LIKE ?)');
-    const like = `%${q.trim()}%`;
+  if (search && search.trim()) {
+    clauses.push(`(description LIKE $${i} OR merchant LIKE $${i + 1})`);
+    const like = `%${search.trim()}%`;
     params.push(like, like);
+    i += 2;
   }
   if (category && category.trim()) {
-    clauses.push('category = ?');
+    clauses.push(`category = $${i}`);
     params.push(category.trim());
+    i += 1;
   }
   if (min_amount !== undefined) {
     const cents = Math.round(Number(min_amount) * 100);
     if (Number.isFinite(cents)) {
-      clauses.push('amount_cents >= ?');
+      clauses.push(`amount_cents >= $${i}`);
       params.push(cents);
+      i += 1;
     }
   }
   if (max_amount !== undefined) {
     const cents = Math.round(Number(max_amount) * 100);
     if (Number.isFinite(cents)) {
-      clauses.push('amount_cents <= ?');
+      clauses.push(`amount_cents <= $${i}`);
       params.push(cents);
+      i += 1;
     }
   }
   if (start_date) {
-    clauses.push('created_at >= ?');
+    clauses.push(`created_at >= $${i}`);
     params.push(start_date);
+    i += 1;
   }
   if (end_date) {
-    // created_at is an ISO timestamp; add a day-boundary so end_date is inclusive
-    // whether the caller passed "YYYY-MM-DD" or a full ISO string.
-    clauses.push('created_at <= ?');
+    clauses.push(`created_at <= $${i}`);
     params.push(end_date.length <= 10 ? `${end_date}T23:59:59.999Z` : end_date);
+    i += 1;
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   return { where, params };
 }
 
-app.get('/transactions', (req, res) => {
+app.get('/transactions', async (req, res) => {
   const { where, params } = buildTransactionQuery(req.query);
-  const rows = db.prepare(`SELECT * FROM transactions ${where} ORDER BY created_at DESC`).all(...params);
+  const { rows } = await q(`SELECT * FROM transactions ${where} ORDER BY created_at DESC`, params);
   res.json(rows.map(t => ({ ...t, amount: t.amount_cents / 100 })));
 });
 
-// ---------- GET /transactions/export ----------
-// Same filters as GET /transactions, returned as a downloadable CSV.
-app.get('/transactions/export', (req, res) => {
+app.get('/transactions/export', async (req, res) => {
   const { where, params } = buildTransactionQuery(req.query);
-  const rows = db.prepare(`SELECT * FROM transactions ${where} ORDER BY created_at DESC`).all(...params);
+  const { rows } = await q(`SELECT * FROM transactions ${where} ORDER BY created_at DESC`, params);
 
   const escape = (val) => {
     if (val === null || val === undefined) return '';
@@ -219,42 +210,35 @@ app.get('/transactions/export', (req, res) => {
   res.send(lines.join('\n'));
 });
 
-// ---------- PATCH /transactions/:id ----------
-// Edit/categorize a transaction record. Only category, description, and
-// merchant are editable here — amount/accounts/status are controlled by the
-// transfer flow itself and shouldn't be hand-edited.
-app.patch('/transactions/:id', (req, res) => {
+app.patch('/transactions/:id', async (req, res) => {
   const { id } = req.params;
   const { category, description, merchant } = req.body;
 
-  const existing = db.prepare('SELECT * FROM transactions WHERE id = ?').get(id);
-  if (!existing) {
-    return res.status(404).json({ error: 'Transaction not found' });
-  }
+  const { rows } = await q('SELECT * FROM transactions WHERE id = $1', [id]);
+  const existing = rows[0];
+  if (!existing) return res.status(404).json({ error: 'Transaction not found' });
 
   const nextCategory = category !== undefined ? normalizeCategory(category) : existing.category;
   if (category !== undefined && category !== null && category.trim() && !nextCategory) {
     return res.status(400).json({ error: 'Invalid category' });
   }
 
-  db.prepare(`
-    UPDATE transactions
-    SET category = ?, description = ?, merchant = ?, updated_at = ?
-    WHERE id = ?
-  `).run(
-    category !== undefined ? nextCategory : existing.category,
-    description !== undefined ? description : existing.description,
-    merchant !== undefined ? merchant : existing.merchant,
-    now(),
-    id
+  await q(
+    `UPDATE transactions SET category = $1, description = $2, merchant = $3, updated_at = $4 WHERE id = $5`,
+    [
+      category !== undefined ? nextCategory : existing.category,
+      description !== undefined ? description : existing.description,
+      merchant !== undefined ? merchant : existing.merchant,
+      now(),
+      id
+    ]
   );
 
-  const updated = db.prepare('SELECT * FROM transactions WHERE id = ?').get(id);
+  const updated = (await q('SELECT * FROM transactions WHERE id = $1', [id])).rows[0];
   return res.json({ ...updated, amount: updated.amount_cents / 100 });
 });
 
-// ---------- POST /transactions/transfer ----------
-app.post('/transactions/transfer', (req, res) => {
+app.post('/transactions/transfer', async (req, res) => {
   const { from_account_id, to_account_id, amount, idempotency_key } = req.body;
 
   if (!from_account_id || !to_account_id || amount === undefined) {
@@ -270,11 +254,11 @@ app.post('/transactions/transfer', (req, res) => {
 
   const idempotencyKey = idempotency_key || uuidv4();
 
-  const existing = db.prepare('SELECT * FROM transactions WHERE idempotency_key = ?').get(idempotencyKey);
-  if (existing) {
-    return res.status(existing.status === 'SUCCESS' ? 200 : 409).json({
-      ...existing,
-      amount: existing.amount_cents / 100,
+  const existingTx = (await q('SELECT * FROM transactions WHERE idempotency_key = $1', [idempotencyKey])).rows[0];
+  if (existingTx) {
+    return res.status(existingTx.status === 'SUCCESS' ? 200 : 409).json({
+      ...existingTx,
+      amount: existingTx.amount_cents / 100,
       duplicate: true
     });
   }
@@ -282,15 +266,18 @@ app.post('/transactions/transfer', (req, res) => {
   const txId = uuidv4();
   const timestamp = now();
 
-  db.prepare(`
-    INSERT INTO transactions
-      (id, idempotency_key, from_account_id, to_account_id, amount_cents, status, failure_reason, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, 'PENDING', NULL, ?, ?)
-  `).run(txId, idempotencyKey, from_account_id, to_account_id, amountCents, timestamp, timestamp);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
 
-  const runTransfer = db.transaction(() => {
-    const fromAccount = db.prepare('SELECT * FROM accounts WHERE id = ?').get(from_account_id);
-    const toAccount = db.prepare('SELECT * FROM accounts WHERE id = ?').get(to_account_id);
+    await client.query(
+      `INSERT INTO transactions (id, idempotency_key, from_account_id, to_account_id, amount_cents, status, failure_reason, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, 'PENDING', NULL, $6, $7)`,
+      [txId, idempotencyKey, from_account_id, to_account_id, amountCents, timestamp, timestamp]
+    );
+
+    const fromAccount = (await client.query('SELECT * FROM accounts WHERE id = $1 FOR UPDATE', [from_account_id])).rows[0];
+    const toAccount = (await client.query('SELECT * FROM accounts WHERE id = $1 FOR UPDATE', [to_account_id])).rows[0];
 
     if (!fromAccount || !toAccount) {
       throw { code: 'NOT_FOUND', message: 'One or both accounts do not exist' };
@@ -302,92 +289,64 @@ app.post('/transactions/transfer', (req, res) => {
       throw { code: 'INSUFFICIENT_FUNDS', message: 'Insufficient balance for this transfer' };
     }
 
-    db.prepare('UPDATE accounts SET balance_cents = balance_cents - ? WHERE id = ?')
-      .run(amountCents, from_account_id);
-    db.prepare('UPDATE accounts SET balance_cents = balance_cents + ? WHERE id = ?')
-      .run(amountCents, to_account_id);
+    await client.query('UPDATE accounts SET balance_cents = balance_cents - $1 WHERE id = $2', [amountCents, from_account_id]);
+    await client.query('UPDATE accounts SET balance_cents = balance_cents + $1 WHERE id = $2', [amountCents, to_account_id]);
+    await client.query(`UPDATE transactions SET status = 'SUCCESS', updated_at = $1 WHERE id = $2`, [now(), txId]);
 
-    db.prepare(`
-      UPDATE transactions
-      SET status = 'SUCCESS', updated_at = ?
-      WHERE id = ?
-    `).run(now(), txId);
-  });
+    await client.query('COMMIT');
 
-  try {
-    runTransfer();
-    const created = db.prepare('SELECT * FROM transactions WHERE id = ?').get(txId);
+    const created = (await q('SELECT * FROM transactions WHERE id = $1', [txId])).rows[0];
     return res.status(201).json({ ...created, amount: created.amount_cents / 100 });
   } catch (err) {
+    await client.query('ROLLBACK');
+
     const reason = err.message || 'Unknown error';
     if (err.code === 'NOT_FOUND') {
-      db.prepare('DELETE FROM transactions WHERE id = ?').run(txId);
+      await q('DELETE FROM transactions WHERE id = $1', [txId]);
     } else {
-      db.prepare(`
-        UPDATE transactions
-        SET status = 'FAILED', failure_reason = ?, updated_at = ?
-        WHERE id = ?
-      `).run(reason, now(), txId);
+      await q(`UPDATE transactions SET status = 'FAILED', failure_reason = $1, updated_at = $2 WHERE id = $3`, [reason, now(), txId]);
     }
     const statusCode = err.code === 'NOT_FOUND' ? 404
       : err.code === 'INSUFFICIENT_FUNDS' ? 422
       : err.code === 'ACCOUNT_INACTIVE' ? 403
       : 500;
     return res.status(statusCode).json({ error: reason });
+  } finally {
+    client.release();
   }
 });
 
 // ================== EXPENSES (Feature 2) ==================
-// Spending against Food / Entertainment / Miscellaneous. Money leaves the account
-// entirely (paid to a shopkeeper, helper, anyone outside the app) — unlike transfers,
-// it never lands in another account here.
 
-// ---------- GET /expenses?account_id=X ----------
-app.get('/expenses', (req, res) => {
+app.get('/expenses', async (req, res) => {
   const { account_id } = req.query;
-  let rows;
-  if (account_id) {
-    rows = db.prepare('SELECT * FROM expenses WHERE account_id = ? ORDER BY created_at DESC').all(account_id);
-  } else {
-    rows = db.prepare('SELECT * FROM expenses ORDER BY created_at DESC').all();
-  }
+  const { rows } = account_id
+    ? await q('SELECT * FROM expenses WHERE account_id = $1 ORDER BY created_at DESC', [account_id])
+    : await q('SELECT * FROM expenses ORDER BY created_at DESC');
   res.json(rows.map(e => ({ ...e, amount: e.amount_cents / 100 })));
 });
 
-// Shared helper so both the normal expense route and the split-share "Pay" route
-// log an expense identically (same balance check, same atomic deduction).
-// Returns the created expense row (raw, cents) or throws { code, message }.
-function createExpenseInternal({ account_id, category, amountCents, payee }) {
-  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(account_id);
-  if (!account) {
-    throw { code: 'NOT_FOUND', message: 'Account not found' };
-  }
-  if (!account.is_active) {
-    throw { code: 'ACCOUNT_INACTIVE', message: 'Account is disabled' };
-  }
-  if (account.balance_cents < amountCents) {
-    throw { code: 'INSUFFICIENT_FUNDS', message: 'Insufficient balance for this expense' };
-  }
+// Shared helper — takes an existing pg client so callers can run it inside
+// their own transaction (used directly by /expenses and by split "pay").
+async function createExpenseWithClient(client, { account_id, category, amountCents, payee }) {
+  const account = (await client.query('SELECT * FROM accounts WHERE id = $1 FOR UPDATE', [account_id])).rows[0];
+  if (!account) throw { code: 'NOT_FOUND', message: 'Account not found' };
+  if (!account.is_active) throw { code: 'ACCOUNT_INACTIVE', message: 'Account is disabled' };
+  if (account.balance_cents < amountCents) throw { code: 'INSUFFICIENT_FUNDS', message: 'Insufficient balance for this expense' };
 
   const expenseId = uuidv4();
   const timestamp = now();
 
-  const runExpense = db.transaction(() => {
-    db.prepare('UPDATE accounts SET balance_cents = balance_cents - ? WHERE id = ?')
-      .run(amountCents, account_id);
-    db.prepare(`
-      INSERT INTO expenses (id, account_id, category, amount_cents, payee, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(expenseId, account_id, category, amountCents, payee, timestamp);
-  });
-  runExpense();
+  await client.query('UPDATE accounts SET balance_cents = balance_cents - $1 WHERE id = $2', [amountCents, account_id]);
+  await client.query(
+    `INSERT INTO expenses (id, account_id, category, amount_cents, payee, created_at) VALUES ($1, $2, $3, $4, $5, $6)`,
+    [expenseId, account_id, category, amountCents, payee, timestamp]
+  );
 
-  return db.prepare('SELECT * FROM expenses WHERE id = ?').get(expenseId);
+  return (await client.query('SELECT * FROM expenses WHERE id = $1', [expenseId])).rows[0];
 }
 
-// ---------- POST /expenses ----------
-// Body: { account_id, category, amount, payee }
-app.post('/expenses', (req, res) => {
+app.post('/expenses', async (req, res) => {
   const { account_id, amount, payee } = req.body;
   const category = normalizeCategory(req.body.category);
 
@@ -402,37 +361,36 @@ app.post('/expenses', (req, res) => {
     return res.status(400).json({ error: 'Amount must be a positive number' });
   }
 
+  const client = await pool.connect();
   try {
-    const created = createExpenseInternal({ account_id, category, amountCents, payee: payee.trim() });
+    await client.query('BEGIN');
+    const created = await createExpenseWithClient(client, { account_id, category, amountCents, payee: payee.trim() });
+    await client.query('COMMIT');
     return res.status(201).json({ ...created, amount: created.amount_cents / 100 });
   } catch (err) {
+    await client.query('ROLLBACK');
     const statusCode = err.code === 'NOT_FOUND' ? 404
       : err.code === 'ACCOUNT_INACTIVE' ? 403
       : err.code === 'INSUFFICIENT_FUNDS' ? 422
       : 500;
     return res.status(statusCode).json({ error: err.message || 'Could not log expense' });
+  } finally {
+    client.release();
   }
 });
 
 // ================== SAVINGS (Feature 2) ==================
-// Savings is a two-way pot: contribute moves money out of the main balance into
-// savings; withdraw moves it back (e.g. for emergencies). Net of the two, for the
-// current month, is what counts toward the Savings budget goal.
 
-// ---------- GET /savings/transactions?account_id=X ----------
-app.get('/savings/transactions', (req, res) => {
+app.get('/savings/transactions', async (req, res) => {
   const { account_id } = req.query;
-  let rows;
-  if (account_id) {
-    rows = db.prepare('SELECT * FROM savings_transactions WHERE account_id = ? ORDER BY created_at DESC').all(account_id);
-  } else {
-    rows = db.prepare('SELECT * FROM savings_transactions ORDER BY created_at DESC').all();
-  }
+  const { rows } = account_id
+    ? await q('SELECT * FROM savings_transactions WHERE account_id = $1 ORDER BY created_at DESC', [account_id])
+    : await q('SELECT * FROM savings_transactions ORDER BY created_at DESC');
   res.json(rows.map(s => ({ ...s, amount: s.amount_cents / 100 })));
 });
 
 function handleSavingsMove(type) {
-  return (req, res) => {
+  return async (req, res) => {
     const { account_id, amount } = req.body;
 
     if (!account_id || amount === undefined) {
@@ -443,75 +401,72 @@ function handleSavingsMove(type) {
       return res.status(400).json({ error: 'Amount must be a positive number' });
     }
 
-    const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(account_id);
-    if (!account) {
-      return res.status(404).json({ error: 'Account not found' });
-    }
-    if (!account.is_active) {
-      return res.status(403).json({ error: 'Account is disabled' });
-    }
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const account = (await client.query('SELECT * FROM accounts WHERE id = $1 FOR UPDATE', [account_id])).rows[0];
+      if (!account) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Account not found' }); }
+      if (!account.is_active) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Account is disabled' }); }
 
-    if (type === 'CONTRIBUTE' && account.balance_cents < amountCents) {
-      return res.status(422).json({ error: 'Insufficient main balance to contribute this amount' });
-    }
-    if (type === 'WITHDRAW' && account.savings_balance_cents < amountCents) {
-      return res.status(422).json({ error: 'Insufficient savings balance to withdraw this amount' });
-    }
+      if (type === 'CONTRIBUTE' && account.balance_cents < amountCents) {
+        await client.query('ROLLBACK');
+        return res.status(422).json({ error: 'Insufficient main balance to contribute this amount' });
+      }
+      if (type === 'WITHDRAW' && account.savings_balance_cents < amountCents) {
+        await client.query('ROLLBACK');
+        return res.status(422).json({ error: 'Insufficient savings balance to withdraw this amount' });
+      }
 
-    const id = uuidv4();
-    const timestamp = now();
+      const id = uuidv4();
+      const timestamp = now();
 
-    const runMove = db.transaction(() => {
       if (type === 'CONTRIBUTE') {
-        db.prepare('UPDATE accounts SET balance_cents = balance_cents - ?, savings_balance_cents = savings_balance_cents + ? WHERE id = ?')
-          .run(amountCents, amountCents, account_id);
+        await client.query(
+          'UPDATE accounts SET balance_cents = balance_cents - $1, savings_balance_cents = savings_balance_cents + $1 WHERE id = $2',
+          [amountCents, account_id]
+        );
       } else {
-        db.prepare('UPDATE accounts SET balance_cents = balance_cents + ?, savings_balance_cents = savings_balance_cents - ? WHERE id = ?')
-          .run(amountCents, amountCents, account_id);
+        await client.query(
+          'UPDATE accounts SET balance_cents = balance_cents + $1, savings_balance_cents = savings_balance_cents - $1 WHERE id = $2',
+          [amountCents, account_id]
+        );
       }
-      db.prepare(`
-        INSERT INTO savings_transactions (id, account_id, type, amount_cents, created_at)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(id, account_id, type, amountCents, timestamp);
-    });
-    runMove();
+      await client.query(
+        `INSERT INTO savings_transactions (id, account_id, type, amount_cents, created_at) VALUES ($1, $2, $3, $4, $5)`,
+        [id, account_id, type, amountCents, timestamp]
+      );
 
-    const created = db.prepare('SELECT * FROM savings_transactions WHERE id = ?').get(id);
-    const updatedAccount = db.prepare('SELECT * FROM accounts WHERE id = ?').get(account_id);
-    return res.status(201).json({
-      ...created,
-      amount: created.amount_cents / 100,
-      account: {
-        id: updatedAccount.id,
-        balance: updatedAccount.balance_cents / 100,
-        savings_balance: updatedAccount.savings_balance_cents / 100
-      }
-    });
+      await client.query('COMMIT');
+
+      const created = (await q('SELECT * FROM savings_transactions WHERE id = $1', [id])).rows[0];
+      const updatedAccount = (await q('SELECT * FROM accounts WHERE id = $1', [account_id])).rows[0];
+      return res.status(201).json({
+        ...created,
+        amount: created.amount_cents / 100,
+        account: {
+          id: updatedAccount.id,
+          balance: updatedAccount.balance_cents / 100,
+          savings_balance: updatedAccount.savings_balance_cents / 100
+        }
+      });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      return res.status(500).json({ error: 'Could not complete savings action' });
+    } finally {
+      client.release();
+    }
   };
 }
 
-// ---------- POST /savings/contribute ----------
 app.post('/savings/contribute', handleSavingsMove('CONTRIBUTE'));
-
-// ---------- POST /savings/withdraw ----------
 app.post('/savings/withdraw', handleSavingsMove('WITHDRAW'));
 
 // ================== BUDGETS (Feature 2) ==================
 
-// ---------- GET /budgets?account_id=X ----------
-// Returns each budget plus live utilization for the current calendar month.
-// Because utilization is always computed from "this month's" rows, budgets
-// reset automatically at the start of each month — no cron job needed.
-app.get('/budgets', (req, res) => {
+app.get('/budgets', async (req, res) => {
   const { account_id, month } = req.query;
-  if (!account_id) {
-    return res.status(400).json({ error: 'account_id is required' });
-  }
+  if (!account_id) return res.status(400).json({ error: 'account_id is required' });
 
-  // Optional ?month=YYYY-MM to view any month (past, current, or future).
-  // Defaults to the current month if not given. Because spend/savings are
-  // always computed live from real rows in that exact month, a future month
-  // with no rows yet naturally comes back as spent: 0 / utilization: 0%.
   let monthPrefix = currentMonthPrefix();
   if (month !== undefined) {
     if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
@@ -520,31 +475,33 @@ app.get('/budgets', (req, res) => {
     monthPrefix = month;
   }
 
-  const budgets = db.prepare('SELECT * FROM budgets WHERE account_id = ?').all(account_id);
+  const budgets = (await q('SELECT * FROM budgets WHERE account_id = $1', [account_id])).rows;
 
-  const result = budgets.map(b => {
+  const result = [];
+  for (const b of budgets) {
     let spentCents = 0;
 
     if (b.category === 'Savings') {
-      const rows = db.prepare(
+      const rows = (await q(
         `SELECT type, SUM(amount_cents) AS total FROM savings_transactions
-         WHERE account_id = ? AND created_at LIKE ? GROUP BY type`
-      ).all(account_id, `${monthPrefix}%`);
-      const contributed = rows.find(r => r.type === 'CONTRIBUTE')?.total || 0;
-      const withdrawn = rows.find(r => r.type === 'WITHDRAW')?.total || 0;
-      spentCents = contributed - withdrawn; // net saved this month
+         WHERE account_id = $1 AND created_at LIKE $2 GROUP BY type`,
+        [account_id, `${monthPrefix}%`]
+      )).rows;
+      const contributed = Number(rows.find(r => r.type === 'CONTRIBUTE')?.total || 0);
+      const withdrawn = Number(rows.find(r => r.type === 'WITHDRAW')?.total || 0);
+      spentCents = contributed - withdrawn;
     } else {
-      const row = db.prepare(
-        `SELECT SUM(amount_cents) AS total FROM expenses
-         WHERE account_id = ? AND category = ? AND created_at LIKE ?`
-      ).get(account_id, b.category, `${monthPrefix}%`);
-      spentCents = row.total || 0;
+      const row = (await q(
+        `SELECT SUM(amount_cents) AS total FROM expenses WHERE account_id = $1 AND category = $2 AND created_at LIKE $3`,
+        [account_id, b.category, `${monthPrefix}%`]
+      )).rows[0];
+      spentCents = Number(row.total || 0);
     }
 
     const limitCents = b.monthly_limit_cents;
     const utilizationPct = limitCents > 0 ? Math.round((spentCents / limitCents) * 100) : 0;
 
-    return {
+    result.push({
       id: b.id,
       account_id: b.account_id,
       category: b.category,
@@ -555,16 +512,13 @@ app.get('/budgets', (req, res) => {
       approaching_limit: b.category !== 'Savings' && utilizationPct >= 80 && utilizationPct < 100,
       over_limit: b.category !== 'Savings' && utilizationPct >= 100,
       goal_reached: b.category === 'Savings' && utilizationPct >= 100
-    };
-  });
+    });
+  }
 
   res.json({ month: monthPrefix, budgets: result });
 });
 
-// ---------- POST /budgets ----------
-// Body: { account_id, category, monthly_limit }
-// Upserts — setting a budget for a category that already has one just updates the limit.
-app.post('/budgets', (req, res) => {
+app.post('/budgets', async (req, res) => {
   const { account_id, monthly_limit } = req.body;
   const category = normalizeCategory(req.body.category);
 
@@ -576,25 +530,22 @@ app.post('/budgets', (req, res) => {
     return res.status(400).json({ error: 'monthly_limit must be a positive number' });
   }
 
-  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(account_id);
-  if (!account) {
-    return res.status(404).json({ error: 'Account not found' });
-  }
+  const account = (await q('SELECT * FROM accounts WHERE id = $1', [account_id])).rows[0];
+  if (!account) return res.status(404).json({ error: 'Account not found' });
 
-  const existing = db.prepare('SELECT * FROM budgets WHERE account_id = ? AND category = ?').get(account_id, category);
+  const existing = (await q('SELECT * FROM budgets WHERE account_id = $1 AND category = $2', [account_id, category])).rows[0];
   const timestamp = now();
 
   if (existing) {
-    db.prepare('UPDATE budgets SET monthly_limit_cents = ?, updated_at = ? WHERE id = ?')
-      .run(limitCents, timestamp, existing.id);
+    await q('UPDATE budgets SET monthly_limit_cents = $1, updated_at = $2 WHERE id = $3', [limitCents, timestamp, existing.id]);
   } else {
-    db.prepare(`
-      INSERT INTO budgets (id, account_id, category, monthly_limit_cents, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(uuidv4(), account_id, category, limitCents, timestamp, timestamp);
+    await q(
+      `INSERT INTO budgets (id, account_id, category, monthly_limit_cents, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [uuidv4(), account_id, category, limitCents, timestamp, timestamp]
+    );
   }
 
-  const saved = db.prepare('SELECT * FROM budgets WHERE account_id = ? AND category = ?').get(account_id, category);
+  const saved = (await q('SELECT * FROM budgets WHERE account_id = $1 AND category = $2', [account_id, category])).rows[0];
   return res.status(existing ? 200 : 201).json({
     id: saved.id,
     account_id: saved.account_id,
@@ -603,53 +554,31 @@ app.post('/budgets', (req, res) => {
   });
 });
 
-// ---------- DELETE /budgets/:id ----------
-// Removes the budget itself only. Past expenses/savings activity already
-// logged under that category is untouched — this just stops tracking a
-// monthly limit for it going forward.
-app.delete('/budgets/:id', (req, res) => {
+app.delete('/budgets/:id', async (req, res) => {
   const { id } = req.params;
-  const existing = db.prepare('SELECT * FROM budgets WHERE id = ?').get(id);
-  if (!existing) {
-    return res.status(404).json({ error: 'Budget not found' });
-  }
-  db.prepare('DELETE FROM budgets WHERE id = ?').run(id);
+  const existing = (await q('SELECT * FROM budgets WHERE id = $1', [id])).rows[0];
+  if (!existing) return res.status(404).json({ error: 'Budget not found' });
+  await q('DELETE FROM budgets WHERE id = $1', [id]);
   return res.status(200).json({ deleted: true, id });
 });
 
-// ---------- GET /categories?account_id=X ----------
-// Default suggestions plus any custom category names already used in expenses
-// or budgets for this account, so the frontend can offer them in a dropdown
-// alongside a "+ Add new category" option. 'Savings' is always included since
-// it's a built-in budget target even though it lives in a different table.
-app.get('/categories', (req, res) => {
+app.get('/categories', async (req, res) => {
   const { account_id } = req.query;
   const used = new Set(DEFAULT_SPEND_CATEGORIES);
 
   if (account_id) {
-    db.prepare('SELECT DISTINCT category FROM expenses WHERE account_id = ?').all(account_id)
-      .forEach(r => used.add(r.category));
-    db.prepare('SELECT DISTINCT category FROM budgets WHERE account_id = ?').all(account_id)
-      .forEach(r => used.add(r.category));
+    (await q('SELECT DISTINCT category FROM expenses WHERE account_id = $1', [account_id])).rows.forEach(r => used.add(r.category));
+    (await q('SELECT DISTINCT category FROM budgets WHERE account_id = $1', [account_id])).rows.forEach(r => used.add(r.category));
   } else {
-    db.prepare('SELECT DISTINCT category FROM expenses').all().forEach(r => used.add(r.category));
-    db.prepare('SELECT DISTINCT category FROM budgets').all().forEach(r => used.add(r.category));
+    (await q('SELECT DISTINCT category FROM expenses')).rows.forEach(r => used.add(r.category));
+    (await q('SELECT DISTINCT category FROM budgets')).rows.forEach(r => used.add(r.category));
   }
   used.delete(RESERVED_CATEGORY);
 
-  res.json({
-    spend_categories: Array.from(used).sort(),
-    reserved: RESERVED_CATEGORY
-  });
+  res.json({ spend_categories: Array.from(used).sort(), reserved: RESERVED_CATEGORY });
 });
 
 // ================== SPLIT A BILL (Feature 3) ==================
-// A split is a template: total amount, category, payee (shopkeeper/cab driver/etc.),
-// and a list of participants (including the creator). Each participant gets their
-// own independent "share" row. There are NO internal transfers between people —
-// each share simply becomes that person's own expense (hitting their own budget)
-// the moment they pay it. The creator's own share is just as PENDING as everyone
-// else's until they pay it too.
 
 function serializeSplit(split, shares) {
   return {
@@ -672,54 +601,42 @@ function serializeSplit(split, shares) {
   };
 }
 
-function getSplitWithShares(splitId) {
-  const split = db.prepare('SELECT * FROM splits WHERE id = ?').get(splitId);
+async function getSplitWithShares(splitId) {
+  const split = (await q('SELECT * FROM splits WHERE id = $1', [splitId])).rows[0];
   if (!split) return null;
-  const shares = db.prepare(`
-    SELECT split_shares.*, accounts.owner_name AS owner_name
-    FROM split_shares
-    JOIN accounts ON accounts.id = split_shares.account_id
-    WHERE split_shares.split_id = ?
-    ORDER BY split_shares.created_at ASC
-  `).all(splitId);
+  const shares = (await q(
+    `SELECT split_shares.*, accounts.owner_name AS owner_name
+     FROM split_shares JOIN accounts ON accounts.id = split_shares.account_id
+     WHERE split_shares.split_id = $1 ORDER BY split_shares.created_at ASC`,
+    [splitId]
+  )).rows;
   return serializeSplit(split, shares);
 }
 
-// ---------- GET /splits?account_id=X ----------
-// Returns every split where account_id is either the creator or a participant,
-// each with the full live list of shares (so the UI can show everyone's
-// paid/pending status, and so "my pending payment" tiles can be derived).
-app.get('/splits', (req, res) => {
+app.get('/splits', async (req, res) => {
   const { account_id } = req.query;
 
   let splitIds;
   if (account_id) {
-    splitIds = db.prepare(`
-      SELECT DISTINCT splits.id FROM splits
-      LEFT JOIN split_shares ON split_shares.split_id = splits.id
-      WHERE splits.creator_account_id = ? OR split_shares.account_id = ?
-      ORDER BY splits.id
-    `).all(account_id, account_id).map(r => r.id);
+    splitIds = (await q(
+      `SELECT DISTINCT splits.id FROM splits
+       LEFT JOIN split_shares ON split_shares.split_id = splits.id
+       WHERE splits.creator_account_id = $1 OR split_shares.account_id = $1
+       ORDER BY splits.id`,
+      [account_id]
+    )).rows.map(r => r.id);
   } else {
-    splitIds = db.prepare('SELECT id FROM splits').all().map(r => r.id);
+    splitIds = (await q('SELECT id FROM splits')).rows.map(r => r.id);
   }
 
-  const results = splitIds
-    .map(id => getSplitWithShares(id))
-    .sort((a, b) => (a.created_at < b.created_at ? 1 : -1)); // newest first
+  const results = [];
+  for (const id of splitIds) results.push(await getSplitWithShares(id));
+  results.sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
 
   res.json(results);
 });
 
-// ---------- POST /splits ----------
-// Body: {
-//   creator_account_id, category, payee, total, split_type: 'EQUAL' | 'CUSTOM',
-//   participants: [account_id, ...]                (for EQUAL), or
-//   participants: [{ account_id, amount }, ...]     (for CUSTOM)
-// }
-// The creator MUST be included in participants themselves if they owe a share too
-// (matches "everyone pays their own share, including the creator").
-app.post('/splits', (req, res) => {
+app.post('/splits', async (req, res) => {
   const { creator_account_id, payee, total, split_type, participants } = req.body;
   const category = normalizeCategory(req.body.category);
 
@@ -741,15 +658,10 @@ app.post('/splits', (req, res) => {
     return res.status(400).json({ error: 'total must be a positive number' });
   }
 
-  const creator = db.prepare('SELECT * FROM accounts WHERE id = ?').get(creator_account_id);
-  if (!creator) {
-    return res.status(404).json({ error: 'Creator account not found' });
-  }
-  if (!creator.is_active) {
-    return res.status(403).json({ error: 'Creator account is disabled' });
-  }
+  const creator = (await q('SELECT * FROM accounts WHERE id = $1', [creator_account_id])).rows[0];
+  if (!creator) return res.status(404).json({ error: 'Creator account not found' });
+  if (!creator.is_active) return res.status(403).json({ error: 'Creator account is disabled' });
 
-  // Normalize participants into a flat list of { account_id, amountCents }
   let shareRows;
   if (split_type === 'EQUAL') {
     const accountIds = participants.map(p => (typeof p === 'string' ? p : p.account_id));
@@ -759,13 +671,7 @@ app.post('/splits', (req, res) => {
     const n = accountIds.length;
     const base = Math.floor(totalCents / n);
     const remainder = totalCents - base * n;
-    // Distribute the leftover cents (from integer division) one at a time
-    // across the first `remainder` participants so shares always sum exactly
-    // to totalCents.
-    shareRows = accountIds.map((account_id, i) => ({
-      account_id,
-      amountCents: base + (i < remainder ? 1 : 0)
-    }));
+    shareRows = accountIds.map((account_id, i) => ({ account_id, amountCents: base + (i < remainder ? 1 : 0) }));
   } else {
     if (participants.some(p => typeof p !== 'object' || !p.account_id || p.amount === undefined)) {
       return res.status(400).json({ error: 'CUSTOM participants must each have account_id and amount' });
@@ -774,10 +680,7 @@ app.post('/splits', (req, res) => {
     if (new Set(accountIds).size !== accountIds.length) {
       return res.status(400).json({ error: 'Duplicate participants are not allowed' });
     }
-    shareRows = participants.map(p => ({
-      account_id: p.account_id,
-      amountCents: Math.round(Number(p.amount) * 100)
-    }));
+    shareRows = participants.map(p => ({ account_id: p.account_id, amountCents: Math.round(Number(p.amount) * 100) }));
     if (shareRows.some(s => !Number.isFinite(s.amountCents) || s.amountCents <= 0)) {
       return res.status(400).json({ error: 'Each participant amount must be a positive number' });
     }
@@ -789,46 +692,40 @@ app.post('/splits', (req, res) => {
     }
   }
 
-  // Validate every participant account exists and is active.
   for (const s of shareRows) {
-    const acc = db.prepare('SELECT * FROM accounts WHERE id = ?').get(s.account_id);
-    if (!acc) {
-      return res.status(404).json({ error: `Participant account not found: ${s.account_id}` });
-    }
-    if (!acc.is_active) {
-      return res.status(403).json({ error: `Participant account is disabled: ${acc.owner_name}` });
-    }
+    const acc = (await q('SELECT * FROM accounts WHERE id = $1', [s.account_id])).rows[0];
+    if (!acc) return res.status(404).json({ error: `Participant account not found: ${s.account_id}` });
+    if (!acc.is_active) return res.status(403).json({ error: `Participant account is disabled: ${acc.owner_name}` });
   }
 
   const splitId = uuidv4();
   const timestamp = now();
 
-  const runCreate = db.transaction(() => {
-    db.prepare(`
-      INSERT INTO splits (id, creator_account_id, category, payee, total_cents, split_type, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(splitId, creator_account_id, category, payee.trim(), totalCents, split_type, timestamp);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO splits (id, creator_account_id, category, payee, total_cents, split_type, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [splitId, creator_account_id, category, payee.trim(), totalCents, split_type, timestamp]
+    );
+    for (const s of shareRows) {
+      await client.query(
+        `INSERT INTO split_shares (id, split_id, account_id, amount_cents, status, expense_id, created_at) VALUES ($1, $2, $3, $4, 'PENDING', NULL, $5)`,
+        [uuidv4(), splitId, s.account_id, s.amountCents, timestamp]
+      );
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: 'Could not create split' });
+  } finally {
+    client.release();
+  }
 
-    const insertShare = db.prepare(`
-      INSERT INTO split_shares (id, split_id, account_id, amount_cents, status, expense_id, created_at)
-      VALUES (?, ?, ?, ?, 'PENDING', NULL, ?)
-    `);
-    shareRows.forEach(s => {
-      insertShare.run(uuidv4(), splitId, s.account_id, s.amountCents, timestamp);
-    });
-  });
-  runCreate();
-
-  return res.status(201).json(getSplitWithShares(splitId));
+  return res.status(201).json(await getSplitWithShares(splitId));
 });
 
-// ---------- POST /splits/:splitId/shares/:shareId/pay ----------
-// Body: { payee } — "what are you paying for" is asked again here per your spec,
-// since this becomes that person's own independent expense record.
-// Logs a normal expense on the paying participant's own account (same category
-// as the split), which is what makes it count against their own budget. No money
-// moves between participants — this is not a transfer.
-app.post('/splits/:splitId/shares/:shareId/pay', (req, res) => {
+app.post('/splits/:splitId/shares/:shareId/pay', async (req, res) => {
   const { splitId, shareId } = req.params;
   const { payee } = req.body;
 
@@ -836,61 +733,53 @@ app.post('/splits/:splitId/shares/:shareId/pay', (req, res) => {
     return res.status(400).json({ error: 'payee is required (what are you paying for)' });
   }
 
-  const split = db.prepare('SELECT * FROM splits WHERE id = ?').get(splitId);
-  if (!split) {
-    return res.status(404).json({ error: 'Split not found' });
-  }
-  const share = db.prepare('SELECT * FROM split_shares WHERE id = ? AND split_id = ?').get(shareId, splitId);
-  if (!share) {
-    return res.status(404).json({ error: 'Share not found on this split' });
-  }
-  if (share.status === 'PAID') {
-    return res.status(409).json({ error: 'This share has already been paid' });
-  }
+  const split = (await q('SELECT * FROM splits WHERE id = $1', [splitId])).rows[0];
+  if (!split) return res.status(404).json({ error: 'Split not found' });
+  const share = (await q('SELECT * FROM split_shares WHERE id = $1 AND split_id = $2', [shareId, splitId])).rows[0];
+  if (!share) return res.status(404).json({ error: 'Share not found on this split' });
+  if (share.status === 'PAID') return res.status(409).json({ error: 'This share has already been paid' });
 
+  const client = await pool.connect();
   try {
-    const expense = createExpenseInternal({
+    await client.query('BEGIN');
+    const expense = await createExpenseWithClient(client, {
       account_id: share.account_id,
       category: split.category,
       amountCents: share.amount_cents,
       payee: payee.trim()
     });
-
-    db.prepare(`UPDATE split_shares SET status = 'PAID', expense_id = ? WHERE id = ?`)
-      .run(expense.id, shareId);
-
-    return res.status(200).json(getSplitWithShares(splitId));
+    await client.query(`UPDATE split_shares SET status = 'PAID', expense_id = $1 WHERE id = $2`, [expense.id, shareId]);
+    await client.query('COMMIT');
+    return res.status(200).json(await getSplitWithShares(splitId));
   } catch (err) {
+    await client.query('ROLLBACK');
     const statusCode = err.code === 'NOT_FOUND' ? 404
       : err.code === 'ACCOUNT_INACTIVE' ? 403
       : err.code === 'INSUFFICIENT_FUNDS' ? 422
       : 500;
     return res.status(statusCode).json({ error: err.message || 'Could not pay this share' });
+  } finally {
+    client.release();
   }
 });
+
 // ================== TRANSACTION IMPORT & ANALYTICS (Feature 5) ==================
 
-// ---------- POST /import/transactions ----------
-// Body: { account_id, csv_data } where csv_data is the raw CSV string
-// Expected CSV columns: date, merchant, amount (minimum required)
-app.post('/import/transactions', (req, res) => {
+app.post('/import/transactions', async (req, res) => {
   const { account_id, csv_data } = req.body;
 
   if (!account_id || !csv_data) {
     return res.status(400).json({ error: 'account_id and csv_data are required' });
   }
 
-  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(account_id);
-  if (!account) {
-    return res.status(404).json({ error: 'Account not found' });
-  }
+  const account = (await q('SELECT * FROM accounts WHERE id = $1', [account_id])).rows[0];
+  if (!account) return res.status(404).json({ error: 'Account not found' });
 
   const lines = csv_data.trim().split('\n');
   if (lines.length < 2) {
     return res.status(400).json({ error: 'CSV must have a header and at least one data row' });
   }
 
-  // Parse header
   const header = lines[0].split(',').map(h => h.trim().toLowerCase());
   const dateIdx = header.indexOf('date');
   const merchantIdx = header.indexOf('merchant');
@@ -931,19 +820,10 @@ app.post('/import/transactions', (req, res) => {
         continue;
       }
 
-      db.prepare(`
-        INSERT INTO transactions
-          (id, idempotency_key, from_account_id, to_account_id, amount_cents, status, created_at, updated_at, merchant)
-        VALUES (?, ?, ?, ?, ?, 'SUCCESS', ?, ?, ?)
-      `).run(
-        txId,
-        `import_${account_id}_${i}_${Date.now()}`,
-        account_id,
-        account_id, // to_account_id = same account (import, not transfer)
-        amountCents,
-        timestamp,
-        timestamp,
-        merchant
+      await q(
+        `INSERT INTO transactions (id, idempotency_key, from_account_id, to_account_id, amount_cents, status, created_at, updated_at, merchant)
+         VALUES ($1, $2, $3, $4, $5, 'SUCCESS', $6, $7, $8)`,
+        [txId, `import_${account_id}_${i}_${Date.now()}`, account_id, account_id, amountCents, timestamp, timestamp, merchant]
       );
 
       imported.push({ date: txDate, merchant, amount: amountCents / 100 });
@@ -952,21 +832,12 @@ app.post('/import/transactions', (req, res) => {
     }
   }
 
-  return res.status(200).json({
-    imported: imported.length,
-    errors,
-    data: imported
-  });
+  return res.status(200).json({ imported: imported.length, errors, data: imported });
 });
 
-// ---------- GET /analytics/spending?account_id=X&month=YYYY-MM ----------
-// Returns total spending by merchant for a given month
-app.get('/analytics/spending', (req, res) => {
+app.get('/analytics/spending', async (req, res) => {
   const { account_id, month } = req.query;
-
-  if (!account_id) {
-    return res.status(400).json({ error: 'account_id is required' });
-  }
+  if (!account_id) return res.status(400).json({ error: 'account_id is required' });
 
   let monthPrefix = currentMonthPrefix();
   if (month !== undefined) {
@@ -976,40 +847,36 @@ app.get('/analytics/spending', (req, res) => {
     monthPrefix = month;
   }
 
-  const rows = db.prepare(`
-    SELECT merchant, SUM(amount_cents) AS total, COUNT(*) AS count
-    FROM transactions
-    WHERE from_account_id = ? AND created_at LIKE ? AND status = 'SUCCESS'
-    GROUP BY merchant
-    ORDER BY total DESC
-  `).all(account_id, `${monthPrefix}%`);
+  const rows = (await q(
+    `SELECT merchant, SUM(amount_cents) AS total, COUNT(*) AS count
+     FROM transactions WHERE from_account_id = $1 AND created_at LIKE $2 AND status = 'SUCCESS'
+     GROUP BY merchant ORDER BY total DESC`,
+    [account_id, `${monthPrefix}%`]
+  )).rows;
 
-  const data = rows.map(r => ({
-    merchant: r.merchant || 'Uncategorized',
-    total: r.total / 100,
-    count: r.count
-  }));
-
+  const data = rows.map(r => ({ merchant: r.merchant || 'Uncategorized', total: Number(r.total) / 100, count: Number(r.count) }));
   const grandTotal = data.reduce((sum, d) => sum + d.total, 0);
 
-  return res.json({
-    month: monthPrefix,
-    total_spending: grandTotal,
-    by_merchant: data
-  });
+  return res.json({ month: monthPrefix, total_spending: grandTotal, by_merchant: data });
 });
-// ---------- DELETE /transactions/:id ----------
-app.delete('/transactions/:id', (req, res) => {
+
+app.delete('/transactions/:id', async (req, res) => {
   const { id } = req.params;
-  const existing = db.prepare('SELECT * FROM transactions WHERE id = ?').get(id);
-  if (!existing) {
-    return res.status(404).json({ error: 'Transaction not found' });
-  }
-  db.prepare('DELETE FROM transactions WHERE id = ?').run(id);
+  const existing = (await q('SELECT * FROM transactions WHERE id = $1', [id])).rows[0];
+  if (!existing) return res.status(404).json({ error: 'Transaction not found' });
+  await q('DELETE FROM transactions WHERE id = $1', [id]);
   return res.status(200).json({ deleted: true, id });
 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+
+init()
+  .then(() => {
+    app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+  })
+  .catch(err => {
+    console.error('Failed to initialize database:', err);
+    process.exit(1);
+  });

@@ -10,11 +10,9 @@ services:
       - /app/node_modules
     environment:
       - CHOKIDAR_USEPOLLING=true
-    # Ensure frontend restarts if it crashes
     restart: unless-stopped
-    # PARTICIPANT TODO: (Optional) If your frontend depends on the backend starting first, uncomment below:
-    # depends_on:
-    #   - backend
+    depends_on:
+      - backend
 
   backend:
     build:
@@ -26,31 +24,32 @@ services:
       - ./backend:/app
       - /app/node_modules
     restart: unless-stopped
-    # environment:
-    #   - DB_URL=jdbc:postgresql://db:5432/event_platform
-    #   - DB_USER=admin
-    #   - DB_PASS=adminpassword
-    # depends_on:
-    #   - db
+    environment:
+      - PGHOST=db
+      - PGPORT=5432
+      - PGUSER=admin
+      - PGPASSWORD=adminpassword
+      - PGDATABASE=event_platform
+    depends_on:
+      db:
+        condition: service_healthy
 
-  # =======================================================================
-  # PARTICIPANT TODO: (Optional) Database Service Example
-  # =======================================================================
-  # If your project requires a database (SQL, NoSQL, etc.), you can add it here.
-  # Here is an example of adding a PostgreSQL service (you could also use MongoDB, MySQL, etc.):
-  # 
-  # db:
-  #   image: postgres:15-alpine
-  #   container_name: event_db
-  #   environment:
-  #     POSTGRES_USER: admin
-  #     POSTGRES_PASSWORD: adminpassword
-  #     POSTGRES_DB: event_platform
-  #   ports:
-  #     - "5432:5432"
-  #   volumes:
-  #     - db_data:/var/lib/postgresql/data
+  db:
+    image: postgres:15-alpine
+    container_name: event_db
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: adminpassword
+      POSTGRES_DB: event_platform
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
-# PARTICIPANT TODO: (Optional) If you added a database with a volume above, declare the volume here:
-# volumes:
-#   db_data:
+volumes:
+  db_data:
