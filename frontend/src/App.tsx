@@ -114,7 +114,11 @@ function App() {
   const [amount, setAmount] = useState('')
   const [sending, setSending] = useState(false)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
-
+  const [pinPrompt, setPinPrompt] = useState<{ accountId: string; onSuccess: () => void } | null>(null)
+const [pinInput, setPinInput] = useState('')
+const [pinError, setPinError] = useState('')
+const [pinChecking, setPinChecking] = useState(false)
+const [newAccountPin, setNewAccountPin] = useState('')
   const [showNewAccount, setShowNewAccount] = useState(false)
   const [newAccountName, setNewAccountName] = useState('')
   const [newAccountBalance, setNewAccountBalance] = useState('')
@@ -397,8 +401,39 @@ function App() {
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accounts.length])
+  function requirePin(accountId: string, onSuccess: () => void) {
+    setPinError('')
+    setPinInput('')
+    setPinPrompt({ accountId, onSuccess })
+  }
 
-  async function handleTransfer(e: React.FormEvent) {
+  async function submitPin(e: React.FormEvent) {
+    e.preventDefault()
+    if (!pinPrompt) return
+    setPinChecking(true)
+    setPinError('')
+    try {
+      const res = await fetch(`${API_BASE}/accounts/${pinPrompt.accountId}/verify-pin`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pin: pinInput }),
+      })
+      const data = await res.json()
+      if (res.ok && data.valid) {
+        const action = pinPrompt.onSuccess
+        setPinPrompt(null)
+        action()
+      } else {
+        setPinError('Incorrect PIN. Try again.')
+      }
+    } catch {
+      setPinError('Could not reach the server.')
+    } finally {
+      setPinChecking(false)
+    }
+  }
+
+ async function handleTransfer(e: React.FormEvent) {
     e.preventDefault()
     setMessage(null)
 
@@ -407,6 +442,10 @@ function App() {
       return
     }
 
+    requirePin(activeAccountId, () => doTransfer())
+  }
+
+  async function doTransfer() {
     setSending(true)
     try {
       const res = await fetch(`${API_BASE}/transactions/transfer`, {
@@ -435,7 +474,7 @@ function App() {
     }
   }
 
-  async function handleCreateAccount(e: React.FormEvent) {
+ async function handleCreateAccount(e: React.FormEvent) {
     e.preventDefault()
     setCreateMessage(null)
 
@@ -452,6 +491,7 @@ function App() {
         body: JSON.stringify({
           owner_name: newAccountName.trim(),
           starting_balance: newAccountBalance ? Number(newAccountBalance) : 0,
+          pin: newAccountPin || undefined,
         }),
       })
       const data = await res.json()
@@ -461,6 +501,7 @@ function App() {
       } else {
         setNewAccountName('')
         setNewAccountBalance('')
+        setNewAccountPin('')
         setShowNewAccount(false)
         await loadData(data.id)
       }
@@ -470,7 +511,6 @@ function App() {
       setCreating(false)
     }
   }
-
   async function handleToggleActive() {
     if (!activeAccount) return
     setTogglingStatus(true)
@@ -783,7 +823,7 @@ function App() {
                 <button
                   key={acc.id}
                   className={acc.id === activeAccountId ? 'active' : ''}
-                  onClick={() => setActiveAccountId(acc.id)}
+                  onClick={() => requirePin(acc.id, () => setActiveAccountId(acc.id))}
                   title={acc.is_active ? '' : 'Disabled account'}
                 >
                   {acc.owner_name}
@@ -823,6 +863,18 @@ function App() {
                 onChange={e => setNewAccountBalance(e.target.value)}
               />
             </div>
+            <div className="field">
+  <label htmlFor="new-pin">4-digit PIN (optional, defaults to 0000)</label>
+  <input
+    id="new-pin"
+    type="text"
+    inputMode="numeric"
+    maxLength={4}
+    placeholder="0000"
+    value={newAccountPin}
+    onChange={e => setNewAccountPin(e.target.value.replace(/\D/g, ''))}
+  />
+</div>
             <button className="send-btn" type="submit" disabled={creating}>
               {creating ? 'Creating…' : 'Create account'}
             </button>
@@ -1785,6 +1837,41 @@ function App() {
     </div>
     <div id="analytics-results" className="empty-state">Select a month to see data.</div>
   </section>
+ {pinPrompt && (
+        <div style={{
+          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000
+        }}>
+          <form
+            onSubmit={submitPin}
+            style={{ background: '#fff', padding: 24, borderRadius: 10, width: 280 }}
+          >
+            <h3 style={{ marginTop: 0 }}>Enter PIN</h3>
+            <input
+              type="password"
+              inputMode="numeric"
+              maxLength={4}
+              autoFocus
+              value={pinInput}
+              onChange={e => setPinInput(e.target.value.replace(/\D/g, ''))}
+              style={{ width: '100%', fontSize: '1.2rem', letterSpacing: 6, textAlign: 'center', padding: 10, marginBottom: 12 }}
+            />
+            {pinError && <div className="form-message error">{pinError}</div>}
+            <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+              <button className="send-btn" type="submit" disabled={pinChecking || pinInput.length !== 4} style={{ flex: 1 }}>
+                {pinChecking ? 'Checking…' : 'Confirm'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setPinPrompt(null)}
+                style={{ flex: 1, background: '#eee', border: 'none', borderRadius: 6, cursor: 'pointer' }}
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </>
   )
 }

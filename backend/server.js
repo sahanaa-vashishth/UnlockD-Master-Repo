@@ -41,7 +41,7 @@ app.get('/accounts', (req, res) => {
 // ---------- POST /accounts ----------
 // Body: { owner_name, starting_balance? }
 app.post('/accounts', (req, res) => {
-  const { owner_name, starting_balance } = req.body;
+  const { owner_name, starting_balance, pin } = req.body;
 
   if (!owner_name || typeof owner_name !== 'string' || !owner_name.trim()) {
     return res.status(400).json({ error: 'owner_name is required' });
@@ -52,10 +52,18 @@ app.post('/accounts', (req, res) => {
     return res.status(400).json({ error: 'starting_balance must be a non-negative number' });
   }
 
+  let finalPin = '0000';
+  if (pin !== undefined && pin !== '') {
+    if (!/^\d{4}$/.test(String(pin))) {
+      return res.status(400).json({ error: 'PIN must be exactly 4 digits' });
+    }
+    finalPin = String(pin);
+  }
+
   const id = 'acc_' + owner_name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_') + '_' + Date.now().toString(36);
 
-  db.prepare('INSERT INTO accounts (id, owner_name, balance_cents, savings_balance_cents, is_active) VALUES (?, ?, ?, 0, 1)')
-    .run(id, owner_name.trim(), startingCents);
+  db.prepare('INSERT INTO accounts (id, owner_name, balance_cents, savings_balance_cents, is_active, pin) VALUES (?, ?, ?, 0, 1, ?)')
+    .run(id, owner_name.trim(), startingCents, finalPin);
 
   return res.status(201).json({
     id,
@@ -92,7 +100,39 @@ app.patch('/accounts/:id/status', (req, res) => {
     is_active: !!updated.is_active
   });
 });
+// ---------- POST /accounts/:id/verify-pin ----------
+app.post('/accounts/:id/verify-pin', (req, res) => {
+  const { id } = req.params;
+  const { pin } = req.body;
 
+  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(id);
+  if (!account) {
+    return res.status(404).json({ error: 'Account not found' });
+  }
+
+  const valid = String(pin) === account.pin;
+  return res.status(valid ? 200 : 401).json({ valid });
+});
+
+// ---------- PATCH /accounts/:id/pin ----------
+app.patch('/accounts/:id/pin', (req, res) => {
+  const { id } = req.params;
+  const { current_pin, new_pin } = req.body;
+
+  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(id);
+  if (!account) {
+    return res.status(404).json({ error: 'Account not found' });
+  }
+  if (String(current_pin) !== account.pin) {
+    return res.status(401).json({ error: 'Current PIN is incorrect' });
+  }
+  if (!/^\d{4}$/.test(String(new_pin))) {
+    return res.status(400).json({ error: 'New PIN must be exactly 4 digits' });
+  }
+
+  db.prepare('UPDATE accounts SET pin = ? WHERE id = ?').run(String(new_pin), id);
+  return res.json({ updated: true });
+});
 // ================== TRANSACTIONS (Feature 1) ==================
 
 // ---------- GET /transactions ----------

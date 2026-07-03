@@ -105,6 +105,9 @@ if (!accountCols.some(c => c.name === 'is_active')) {
 if (!accountCols.some(c => c.name === 'savings_balance_cents')) {
   db.exec('ALTER TABLE accounts ADD COLUMN savings_balance_cents INTEGER NOT NULL DEFAULT 0');
 }
+if (!accountCols.some(c => c.name === 'pin')) {
+  db.exec("ALTER TABLE accounts ADD COLUMN pin TEXT NOT NULL DEFAULT '0000'");
+}
 // ---- Feature 4: Transaction Management — search/filter/categorize/edit ----
 const txCols = db.prepare("PRAGMA table_info(transactions)").all();
 if (!txCols.some(c => c.name === 'category')) {
