@@ -1774,12 +1774,19 @@ const [newAccountPin, setNewAccountPin] = useState('')
     return;
   }
   
+let res: Response;
   try {
-    const res = await fetch(`${API_BASE}/import/transactions`, {
+    res = await fetch(`${API_BASE}/import/transactions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ account_id: targetAccountId, csv_data: csvData })
     });
+  } catch {
+    setTmMessage({ type: 'error', text: 'Could not reach the server. Is the backend running?' });
+    return;
+  }
+
+  try {
     const data = await res.json();
     if (!res.ok) {
       setTmMessage({ type: 'error', text: data.error || 'Import failed' });
@@ -1791,7 +1798,7 @@ const [newAccountPin, setNewAccountPin] = useState('')
       setCompareRefreshKey(k => k + 1);
     }
   } catch {
-    setTmMessage({ type: 'error', text: 'Could not reach server.' });
+    setTmMessage({ type: 'error', text: 'Import succeeded but the response could not be read. Refresh to confirm.' });
   }
 }}>
       <textarea
