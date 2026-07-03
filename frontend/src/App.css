@@ -348,3 +348,19 @@
     text-align: left;
   }
 }
+
+/* ---------- Transaction Management row (Feature 4) ---------- */
+/* Needs a wider, flexible last column for Edit/Save/Cancel buttons, and a
+   taller middle column since editing shows 3 stacked inputs. Kept separate
+   from .ledger-row so the other ledgers (transfers/expenses/savings) are untouched. */
+.ledger-row.tm-row {
+  grid-template-columns: 110px 1fr 120px 160px;
+}
+
+@media (max-width: 720px) {
+  .ledger-row.tm-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
+    min-width: 0;
+  }
+}

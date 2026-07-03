@@ -96,19 +96,121 @@ app.patch('/accounts/:id/status', (req, res) => {
 // ================== TRANSACTIONS (Feature 1) ==================
 
 // ---------- GET /transactions ----------
-app.get('/transactions', (req, res) => {
-  const { account_id } = req.query;
-  let rows;
+// Supports Feature 4: search by description/merchant, filter by date range,
+// category, amount range, and account. All params optional and combinable.
+function buildTransactionQuery(query) {
+  const { account_id, q, category, min_amount, max_amount, start_date, end_date } = query;
+
+  const clauses = [];
+  const params = [];
+
   if (account_id) {
-    rows = db.prepare(
-      `SELECT * FROM transactions
-       WHERE from_account_id = ? OR to_account_id = ?
-       ORDER BY created_at DESC`
-    ).all(account_id, account_id);
-  } else {
-    rows = db.prepare('SELECT * FROM transactions ORDER BY created_at DESC').all();
+    clauses.push('(from_account_id = ? OR to_account_id = ?)');
+    params.push(account_id, account_id);
   }
+  if (q && q.trim()) {
+    clauses.push('(description LIKE ? OR merchant LIKE ?)');
+    const like = `%${q.trim()}%`;
+    params.push(like, like);
+  }
+  if (category && category.trim()) {
+    clauses.push('category = ?');
+    params.push(category.trim());
+  }
+  if (min_amount !== undefined) {
+    const cents = Math.round(Number(min_amount) * 100);
+    if (Number.isFinite(cents)) {
+      clauses.push('amount_cents >= ?');
+      params.push(cents);
+    }
+  }
+  if (max_amount !== undefined) {
+    const cents = Math.round(Number(max_amount) * 100);
+    if (Number.isFinite(cents)) {
+      clauses.push('amount_cents <= ?');
+      params.push(cents);
+    }
+  }
+  if (start_date) {
+    clauses.push('created_at >= ?');
+    params.push(start_date);
+  }
+  if (end_date) {
+    // created_at is an ISO timestamp; add a day-boundary so end_date is inclusive
+    // whether the caller passed "YYYY-MM-DD" or a full ISO string.
+    clauses.push('created_at <= ?');
+    params.push(end_date.length <= 10 ? `${end_date}T23:59:59.999Z` : end_date);
+  }
+
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  return { where, params };
+}
+
+app.get('/transactions', (req, res) => {
+  const { where, params } = buildTransactionQuery(req.query);
+  const rows = db.prepare(`SELECT * FROM transactions ${where} ORDER BY created_at DESC`).all(...params);
   res.json(rows.map(t => ({ ...t, amount: t.amount_cents / 100 })));
+});
+
+// ---------- GET /transactions/export ----------
+// Same filters as GET /transactions, returned as a downloadable CSV.
+app.get('/transactions/export', (req, res) => {
+  const { where, params } = buildTransactionQuery(req.query);
+  const rows = db.prepare(`SELECT * FROM transactions ${where} ORDER BY created_at DESC`).all(...params);
+
+  const escape = (val) => {
+    if (val === null || val === undefined) return '';
+    const str = String(val);
+    return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+  };
+
+  const header = ['id', 'created_at', 'from_account_id', 'to_account_id', 'amount', 'status', 'category', 'merchant', 'description'];
+  const lines = [header.join(',')];
+  rows.forEach(t => {
+    lines.push([
+      t.id, t.created_at, t.from_account_id, t.to_account_id,
+      (t.amount_cents / 100).toFixed(2), t.status,
+      t.category, t.merchant, t.description
+    ].map(escape).join(','));
+  });
+
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="transactions.csv"');
+  res.send(lines.join('\n'));
+});
+
+// ---------- PATCH /transactions/:id ----------
+// Edit/categorize a transaction record. Only category, description, and
+// merchant are editable here — amount/accounts/status are controlled by the
+// transfer flow itself and shouldn't be hand-edited.
+app.patch('/transactions/:id', (req, res) => {
+  const { id } = req.params;
+  const { category, description, merchant } = req.body;
+
+  const existing = db.prepare('SELECT * FROM transactions WHERE id = ?').get(id);
+  if (!existing) {
+    return res.status(404).json({ error: 'Transaction not found' });
+  }
+
+  const nextCategory = category !== undefined ? normalizeCategory(category) : existing.category;
+  if (category !== undefined && category !== null && category.trim() && !nextCategory) {
+    return res.status(400).json({ error: 'Invalid category' });
+  }
+
+  db.prepare(`
+    UPDATE transactions
+    SET category = ?, description = ?, merchant = ?, updated_at = ?
+    WHERE id = ?
+  `).run(
+    category !== undefined ? nextCategory : existing.category,
+    description !== undefined ? description : existing.description,
+    merchant !== undefined ? merchant : existing.merchant,
+    now(),
+    id
+  );
+
+  const updated = db.prepare('SELECT * FROM transactions WHERE id = ?').get(id);
+  return res.json({ ...updated, amount: updated.amount_cents / 100 });
 });
 
 // ---------- POST /transactions/transfer ----------

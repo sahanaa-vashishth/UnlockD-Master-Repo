@@ -19,6 +19,9 @@ interface Transaction {
   status: 'SUCCESS' | 'FAILED' | 'PENDING'
   failure_reason: string | null
   created_at: string
+  category?: string | null
+  description?: string | null
+  merchant?: string | null
 }
 
 interface Expense {
@@ -168,10 +171,28 @@ function App() {
   const [splitMessage, setSplitMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
   // Paying one pending share
+  // Paying one pending share
   const [payingShare, setPayingShare] = useState<{ splitId: string; shareId: string } | null>(null)
   const [payPayeeInput, setPayPayeeInput] = useState('')
   const [payingBusy, setPayingBusy] = useState(false)
   const [payMessage, setPayMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+
+  // ---- Transaction Management (Feature 4) ----
+  const [tmSearch, setTmSearch] = useState('')
+  const [tmCategory, setTmCategory] = useState('')
+  const [tmMinAmount, setTmMinAmount] = useState('')
+  const [tmMaxAmount, setTmMaxAmount] = useState('')
+  const [tmStartDate, setTmStartDate] = useState('')
+  const [tmEndDate, setTmEndDate] = useState('')
+  const [tmAccountOnly, setTmAccountOnly] = useState(true) // true = only active account
+  const [managedTransactions, setManagedTransactions] = useState<Transaction[]>([])
+  const [tmLoading, setTmLoading] = useState(false)
+  const [tmMessage, setTmMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [editingTxId, setEditingTxId] = useState<string | null>(null)
+  const [editCategory, setEditCategory] = useState('')
+  const [editDescription, setEditDescription] = useState('')
+  const [editMerchant, setEditMerchant] = useState('')
+  const [savingEdit, setSavingEdit] = useState(false)
 
   const loadData = useCallback(async (preferAccountId?: string) => {
     const [accRes, txRes] = await Promise.all([
@@ -218,6 +239,79 @@ function App() {
     const res = await fetch(`${API_BASE}/splits?account_id=${accountId}`)
     setSplits(await res.json())
   }, [])
+
+  function buildTmParams(accountId: string) {
+    const params = new URLSearchParams()
+    if (tmAccountOnly && accountId) params.set('account_id', accountId)
+    if (tmSearch.trim()) params.set('q', tmSearch.trim())
+    if (tmCategory.trim()) params.set('category', tmCategory.trim())
+    if (tmMinAmount) params.set('min_amount', tmMinAmount)
+    if (tmMaxAmount) params.set('max_amount', tmMaxAmount)
+    if (tmStartDate) params.set('start_date', tmStartDate)
+    if (tmEndDate) params.set('end_date', tmEndDate)
+    return params
+  }
+
+  const runTransactionSearch = useCallback(async () => {
+    setTmLoading(true)
+    setTmMessage(null)
+    try {
+      const params = buildTmParams(activeAccountId)
+      const res = await fetch(`${API_BASE}/transactions?${params.toString()}`)
+      if (!res.ok) throw new Error('Search failed')
+      setManagedTransactions(await res.json())
+    } catch {
+      setTmMessage({ type: 'error', text: 'Could not search transactions. Is the backend running?' })
+    } finally {
+      setTmLoading(false)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeAccountId, tmAccountOnly, tmSearch, tmCategory, tmMinAmount, tmMaxAmount, tmStartDate, tmEndDate])
+
+  useEffect(() => {
+    runTransactionSearch()
+  }, [runTransactionSearch])
+
+  function startEditTx(tx: Transaction) {
+    setEditingTxId(tx.id)
+    setEditCategory(tx.category || '')
+    setEditDescription(tx.description || '')
+    setEditMerchant(tx.merchant || '')
+    setTmMessage(null)
+  }
+
+  async function handleSaveEditTx(txId: string) {
+    setSavingEdit(true)
+    setTmMessage(null)
+    try {
+      const res = await fetch(`${API_BASE}/transactions/${txId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          category: editCategory.trim() || null,
+          description: editDescription.trim() || null,
+          merchant: editMerchant.trim() || null,
+        }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setTmMessage({ type: 'error', text: data.error || 'Could not update transaction.' })
+      } else {
+        setEditingTxId(null)
+        await runTransactionSearch()
+        await loadData(activeAccountId)
+      }
+    } catch {
+      setTmMessage({ type: 'error', text: 'Could not reach the server. Is the backend running?' })
+    } finally {
+      setSavingEdit(false)
+    }
+  }
+
+  function handleExportTransactions() {
+    const params = buildTmParams(activeAccountId)
+    window.open(`${API_BASE}/transactions/export?${params.toString()}`, '_blank')
+  }
 
   const fetchBudgetsForMonth = useCallback(async (accountId: string, month: string): Promise<Budget[]> => {
     const res = await fetch(`${API_BASE}/budgets?account_id=${accountId}&month=${month}`)
@@ -1402,7 +1496,7 @@ function App() {
           {savingsTxs.length === 0 && (
             <div className="empty-state">No savings activity yet.</div>
           )}
-          {savingsTxs.map(s => (
+         {savingsTxs.map(s => (
             <div className="ledger-row" key={s.id}>
               <span>{formatTime(s.created_at)}</span>
               <span className="parties"><strong>{s.type === 'CONTRIBUTE' ? 'Added to savings' : 'Withdrawn from savings'}</strong></span>
@@ -1413,6 +1507,173 @@ function App() {
             </div>
           ))}
         </div>
+      </section>
+
+      <section className="ledger-section" style={{ marginTop: 24 }}>
+        <h2>Transaction Management</h2>
+
+        <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 16 }}>
+          <div className="field" style={{ flex: 2, minWidth: 200 }}>
+            <label htmlFor="tm-search">Search (description / merchant)</label>
+            <input
+              id="tm-search"
+              type="text"
+              placeholder="e.g. Amazon, groceries"
+              value={tmSearch}
+              onChange={e => setTmSearch(e.target.value)}
+            />
+          </div>
+          <div className="field" style={{ flex: 1, minWidth: 140 }}>
+            <label htmlFor="tm-category">Category</label>
+            <input
+              id="tm-category"
+              type="text"
+              placeholder="e.g. Food"
+              value={tmCategory}
+              onChange={e => setTmCategory(e.target.value)}
+            />
+          </div>
+          <div className="field" style={{ flex: 1, minWidth: 120 }}>
+            <label htmlFor="tm-min">Min amount</label>
+            <input
+              id="tm-min"
+              type="number"
+              step="0.01"
+              value={tmMinAmount}
+              onChange={e => setTmMinAmount(e.target.value)}
+            />
+          </div>
+          <div className="field" style={{ flex: 1, minWidth: 120 }}>
+            <label htmlFor="tm-max">Max amount</label>
+            <input
+              id="tm-max"
+              type="number"
+              step="0.01"
+              value={tmMaxAmount}
+              onChange={e => setTmMaxAmount(e.target.value)}
+            />
+          </div>
+          <div className="field" style={{ flex: 1, minWidth: 150 }}>
+            <label htmlFor="tm-start">From date</label>
+            <input
+              id="tm-start"
+              type="date"
+              value={tmStartDate}
+              onChange={e => setTmStartDate(e.target.value)}
+            />
+          </div>
+          <div className="field" style={{ flex: 1, minWidth: 150 }}>
+            <label htmlFor="tm-end">To date</label>
+            <input
+              id="tm-end"
+              type="date"
+              value={tmEndDate}
+              onChange={e => setTmEndDate(e.target.value)}
+            />
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 400 }}>
+            <input
+              type="checkbox"
+              checked={tmAccountOnly}
+              onChange={e => setTmAccountOnly(e.target.checked)}
+            />
+            Only {activeAccount?.owner_name ?? 'this account'}
+          </label>
+          <button type="button" className="new-account-btn" onClick={handleExportTransactions}>
+            Export CSV
+          </button>
+        </div>
+
+        {tmMessage && <div className={`form-message ${tmMessage.type}`}>{tmMessage.text}</div>}
+        {tmLoading && <div className="empty-state">Searching…</div>}
+
+        {!tmLoading && (
+          <div className="ledger">
+            <div className="ledger-row tm-row head">
+              <span>Date</span>
+              <span>Category / Merchant / Description</span>
+              <span>Amount</span>
+              <span>Actions</span>
+            </div>
+            {managedTransactions.length === 0 && (
+              <div className="empty-state">No transactions match these filters.</div>
+            )}
+            {managedTransactions.map(tx => {
+              const isOutgoing = tx.from_account_id === activeAccountId
+              const isEditing = editingTxId === tx.id
+              return (
+                <div className="ledger-row tm-row" key={tx.id}>
+                  <span>{formatTime(tx.created_at)}</span>
+                  {isEditing ? (
+                    <span style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <input
+                        type="text"
+                        placeholder="Category"
+                        value={editCategory}
+                        onChange={e => setEditCategory(e.target.value)}
+                      />
+                      <input
+                        type="text"
+                        placeholder="Merchant"
+                        value={editMerchant}
+                        onChange={e => setEditMerchant(e.target.value)}
+                      />
+                      <input
+                        type="text"
+                        placeholder="Description"
+                        value={editDescription}
+                        onChange={e => setEditDescription(e.target.value)}
+                      />
+                    </span>
+                  ) : (
+                    <span className="parties">
+                      {tx.category && <strong>{tx.category}</strong>}
+                      {tx.merchant && ` · ${tx.merchant}`}
+                      {tx.description && ` — ${tx.description}`}
+                      {!tx.category && !tx.merchant && !tx.description && <em>Uncategorized</em>}
+                    </span>
+                  )}
+                  <span className={`amount ${isOutgoing ? 'debit' : 'credit'}`}>
+                    {isOutgoing ? '−' : '+'}${formatMoney(tx.amount)}
+                  </span>
+                  <span>
+                    {isEditing ? (
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        <button
+                          type="button"
+                          className="send-btn"
+                          style={{ padding: '4px 10px', fontSize: '0.8rem' }}
+                          disabled={savingEdit}
+                          onClick={() => handleSaveEditTx(tx.id)}
+                        >
+                          {savingEdit ? 'Saving…' : 'Save'}
+                        </button>
+                        <button
+                          type="button"
+                          style={{ padding: '4px 10px', fontSize: '0.8rem', background: '#eee', border: 'none', borderRadius: 6, cursor: 'pointer' }}
+                          onClick={() => setEditingTxId(null)}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        style={{ padding: '4px 10px', fontSize: '0.8rem', background: '#eee', border: 'none', borderRadius: 6, cursor: 'pointer' }}
+                        onClick={() => startEditTx(tx)}
+                      >
+                        Edit
+                      </button>
+                    )}
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+        )}
       </section>
     </>
   )

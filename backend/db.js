@@ -105,6 +105,18 @@ if (!accountCols.some(c => c.name === 'is_active')) {
 if (!accountCols.some(c => c.name === 'savings_balance_cents')) {
   db.exec('ALTER TABLE accounts ADD COLUMN savings_balance_cents INTEGER NOT NULL DEFAULT 0');
 }
+// ---- Feature 4: Transaction Management — search/filter/categorize/edit ----
+const txCols = db.prepare("PRAGMA table_info(transactions)").all();
+if (!txCols.some(c => c.name === 'category')) {
+  db.exec("ALTER TABLE transactions ADD COLUMN category TEXT");
+}
+if (!txCols.some(c => c.name === 'description')) {
+  db.exec("ALTER TABLE transactions ADD COLUMN description TEXT");
+}
+if (!txCols.some(c => c.name === 'merchant')) {
+  db.exec("ALTER TABLE transactions ADD COLUMN merchant TEXT");
+}
+
 
 // SQLite can't drop a CHECK constraint with ALTER TABLE, so if an existing
 // data.sqlite still has the old fixed-category CHECK on expenses/budgets,
