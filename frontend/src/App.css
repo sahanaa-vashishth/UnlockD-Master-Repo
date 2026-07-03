@@ -1,3 +1,8 @@
+/* ---------- Global box sizing (safe default so padding never causes horizontal overflow on narrower laptop windows) ---------- */
+* {
+  box-sizing: border-box;
+}
+
 /* ---------- Header ---------- */
 .topbar {
   display: flex;
@@ -5,6 +10,8 @@
   justify-content: space-between;
   padding: 32px 0 24px;
   border-bottom: 1px solid var(--hairline);
+  flex-wrap: wrap;
+  gap: 16px;
 }
 
 .wordmark {
@@ -12,7 +19,7 @@
   align-items: center;
   gap: 8px;
   font-family: var(--display);
-  font-size: 26px;
+  font-size: clamp(21px, 2.4vw, 26px);
   letter-spacing: -0.3px;
 }
 
@@ -26,11 +33,13 @@
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-wrap: wrap;
 }
 
 .account-switcher {
   display: flex;
   gap: 6px;
+  flex-wrap: wrap;
   background: var(--paper-raised);
   border: 1px solid var(--hairline);
   border-radius: 8px;
@@ -64,6 +73,7 @@
   font-weight: 500;
   cursor: pointer;
   transition: border-color 0.15s, background 0.15s;
+  white-space: nowrap;
 }
 
 .new-account-btn:hover {
@@ -81,6 +91,7 @@
   border-radius: 12px;
   padding: 24px;
   max-width: 420px;
+  width: 100%;
 }
 
 /* ---------- Main grid ---------- */
@@ -89,6 +100,18 @@
   grid-template-columns: 1fr 1.2fr;
   gap: 24px;
   padding: 32px 0;
+  /* Cards keep their own natural height instead of being stretched to match
+     the tallest card in the row — important now that some pairings (e.g.
+     Log an expense next to Budgets) are very different heights. */
+  align-items: start;
+}
+
+/* Intermediate breakpoint: on smaller laptop windows / tablets, keep two
+   columns but tighten spacing before fully stacking. */
+@media (max-width: 1024px) {
+  .main-grid {
+    gap: 18px;
+  }
 }
 
 @media (max-width: 720px) {
@@ -106,6 +129,7 @@
   display: flex;
   flex-direction: column;
   justify-content: space-between;
+  height: 100%;
 }
 
 .balance-card .label {
@@ -118,9 +142,10 @@
 
 .balance-card .amount {
   font-family: var(--mono);
-  font-size: 42px;
+  font-size: clamp(30px, 4vw, 42px);
   font-weight: 500;
   letter-spacing: -1px;
+  word-break: break-word;
 }
 
 .balance-card .owner {
@@ -129,12 +154,20 @@
   color: rgba(247, 245, 239, 0.6);
 }
 
-/* ---------- Transfer form ---------- */
+/* ---------- Transfer / generic card ---------- */
 .transfer-card {
   background: var(--paper-raised);
   border: 1px solid var(--hairline);
   border-radius: 12px;
   padding: 28px;
+  min-width: 0; /* lets long content (e.g. budget rows) shrink instead of overflowing the grid column */
+}
+
+@media (max-width: 720px) {
+  .transfer-card,
+  .balance-card {
+    padding: 20px;
+  }
 }
 
 .transfer-card h2 {
@@ -224,6 +257,7 @@
   border: 1px solid var(--hairline);
   border-radius: 12px;
   overflow: hidden;
+  overflow-x: auto; /* safety net on narrow laptop windows so rows scroll instead of breaking layout */
 }
 
 .ledger-row {
@@ -234,6 +268,7 @@
   padding: 14px 20px;
   border-bottom: 1px solid var(--hairline);
   font-size: 14px;
+  min-width: 480px; /* keeps columns legible instead of crushing together before the row-collapse breakpoint kicks in */
 }
 
 .ledger-row:last-child {
@@ -291,6 +326,11 @@
   color: var(--debit);
 }
 
+.status-badge.PENDING {
+  background: rgba(184, 134, 11, 0.14);
+  color: var(--brass-dark);
+}
+
 .empty-state {
   padding: 40px 20px;
   text-align: center;
@@ -302,6 +342,7 @@
   .ledger-row {
     grid-template-columns: 1fr;
     gap: 4px;
+    min-width: 0;
   }
   .ledger-row .amount {
     text-align: left;

@@ -212,6 +212,37 @@ app.get('/expenses', (req, res) => {
   res.json(rows.map(e => ({ ...e, amount: e.amount_cents / 100 })));
 });
 
+// Shared helper so both the normal expense route and the split-share "Pay" route
+// log an expense identically (same balance check, same atomic deduction).
+// Returns the created expense row (raw, cents) or throws { code, message }.
+function createExpenseInternal({ account_id, category, amountCents, payee }) {
+  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(account_id);
+  if (!account) {
+    throw { code: 'NOT_FOUND', message: 'Account not found' };
+  }
+  if (!account.is_active) {
+    throw { code: 'ACCOUNT_INACTIVE', message: 'Account is disabled' };
+  }
+  if (account.balance_cents < amountCents) {
+    throw { code: 'INSUFFICIENT_FUNDS', message: 'Insufficient balance for this expense' };
+  }
+
+  const expenseId = uuidv4();
+  const timestamp = now();
+
+  const runExpense = db.transaction(() => {
+    db.prepare('UPDATE accounts SET balance_cents = balance_cents - ? WHERE id = ?')
+      .run(amountCents, account_id);
+    db.prepare(`
+      INSERT INTO expenses (id, account_id, category, amount_cents, payee, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(expenseId, account_id, category, amountCents, payee, timestamp);
+  });
+  runExpense();
+
+  return db.prepare('SELECT * FROM expenses WHERE id = ?').get(expenseId);
+}
+
 // ---------- POST /expenses ----------
 // Body: { account_id, category, amount, payee }
 app.post('/expenses', (req, res) => {
@@ -229,32 +260,16 @@ app.post('/expenses', (req, res) => {
     return res.status(400).json({ error: 'Amount must be a positive number' });
   }
 
-  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(account_id);
-  if (!account) {
-    return res.status(404).json({ error: 'Account not found' });
+  try {
+    const created = createExpenseInternal({ account_id, category, amountCents, payee: payee.trim() });
+    return res.status(201).json({ ...created, amount: created.amount_cents / 100 });
+  } catch (err) {
+    const statusCode = err.code === 'NOT_FOUND' ? 404
+      : err.code === 'ACCOUNT_INACTIVE' ? 403
+      : err.code === 'INSUFFICIENT_FUNDS' ? 422
+      : 500;
+    return res.status(statusCode).json({ error: err.message || 'Could not log expense' });
   }
-  if (!account.is_active) {
-    return res.status(403).json({ error: 'Account is disabled' });
-  }
-  if (account.balance_cents < amountCents) {
-    return res.status(422).json({ error: 'Insufficient balance for this expense' });
-  }
-
-  const expenseId = uuidv4();
-  const timestamp = now();
-
-  const runExpense = db.transaction(() => {
-    db.prepare('UPDATE accounts SET balance_cents = balance_cents - ? WHERE id = ?')
-      .run(amountCents, account_id);
-    db.prepare(`
-      INSERT INTO expenses (id, account_id, category, amount_cents, payee, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(expenseId, account_id, category, amountCents, payee.trim(), timestamp);
-  });
-  runExpense();
-
-  const created = db.prepare('SELECT * FROM expenses WHERE id = ?').get(expenseId);
-  return res.status(201).json({ ...created, amount: created.amount_cents / 100 });
 });
 
 // ================== SAVINGS (Feature 2) ==================
@@ -484,6 +499,232 @@ app.get('/categories', (req, res) => {
     spend_categories: Array.from(used).sort(),
     reserved: RESERVED_CATEGORY
   });
+});
+
+// ================== SPLIT A BILL (Feature 3) ==================
+// A split is a template: total amount, category, payee (shopkeeper/cab driver/etc.),
+// and a list of participants (including the creator). Each participant gets their
+// own independent "share" row. There are NO internal transfers between people —
+// each share simply becomes that person's own expense (hitting their own budget)
+// the moment they pay it. The creator's own share is just as PENDING as everyone
+// else's until they pay it too.
+
+function serializeSplit(split, shares) {
+  return {
+    id: split.id,
+    creator_account_id: split.creator_account_id,
+    category: split.category,
+    payee: split.payee,
+    total: split.total_cents / 100,
+    split_type: split.split_type,
+    created_at: split.created_at,
+    shares: shares.map(s => ({
+      id: s.id,
+      split_id: s.split_id,
+      account_id: s.account_id,
+      owner_name: s.owner_name,
+      amount: s.amount_cents / 100,
+      status: s.status,
+      expense_id: s.expense_id
+    }))
+  };
+}
+
+function getSplitWithShares(splitId) {
+  const split = db.prepare('SELECT * FROM splits WHERE id = ?').get(splitId);
+  if (!split) return null;
+  const shares = db.prepare(`
+    SELECT split_shares.*, accounts.owner_name AS owner_name
+    FROM split_shares
+    JOIN accounts ON accounts.id = split_shares.account_id
+    WHERE split_shares.split_id = ?
+    ORDER BY split_shares.created_at ASC
+  `).all(splitId);
+  return serializeSplit(split, shares);
+}
+
+// ---------- GET /splits?account_id=X ----------
+// Returns every split where account_id is either the creator or a participant,
+// each with the full live list of shares (so the UI can show everyone's
+// paid/pending status, and so "my pending payment" tiles can be derived).
+app.get('/splits', (req, res) => {
+  const { account_id } = req.query;
+
+  let splitIds;
+  if (account_id) {
+    splitIds = db.prepare(`
+      SELECT DISTINCT splits.id FROM splits
+      LEFT JOIN split_shares ON split_shares.split_id = splits.id
+      WHERE splits.creator_account_id = ? OR split_shares.account_id = ?
+      ORDER BY splits.id
+    `).all(account_id, account_id).map(r => r.id);
+  } else {
+    splitIds = db.prepare('SELECT id FROM splits').all().map(r => r.id);
+  }
+
+  const results = splitIds
+    .map(id => getSplitWithShares(id))
+    .sort((a, b) => (a.created_at < b.created_at ? 1 : -1)); // newest first
+
+  res.json(results);
+});
+
+// ---------- POST /splits ----------
+// Body: {
+//   creator_account_id, category, payee, total, split_type: 'EQUAL' | 'CUSTOM',
+//   participants: [account_id, ...]                (for EQUAL), or
+//   participants: [{ account_id, amount }, ...]     (for CUSTOM)
+// }
+// The creator MUST be included in participants themselves if they owe a share too
+// (matches "everyone pays their own share, including the creator").
+app.post('/splits', (req, res) => {
+  const { creator_account_id, payee, total, split_type, participants } = req.body;
+  const category = normalizeCategory(req.body.category);
+
+  if (!creator_account_id || !category || !payee || !payee.trim() || total === undefined) {
+    return res.status(400).json({ error: 'creator_account_id, category, payee and total are required' });
+  }
+  if (category === RESERVED_CATEGORY) {
+    return res.status(400).json({ error: `"${RESERVED_CATEGORY}" cannot be used as a split category` });
+  }
+  if (split_type !== 'EQUAL' && split_type !== 'CUSTOM') {
+    return res.status(400).json({ error: "split_type must be 'EQUAL' or 'CUSTOM'" });
+  }
+  if (!Array.isArray(participants) || participants.length === 0) {
+    return res.status(400).json({ error: 'participants must be a non-empty array' });
+  }
+
+  const totalCents = Math.round(Number(total) * 100);
+  if (!Number.isFinite(totalCents) || totalCents <= 0) {
+    return res.status(400).json({ error: 'total must be a positive number' });
+  }
+
+  const creator = db.prepare('SELECT * FROM accounts WHERE id = ?').get(creator_account_id);
+  if (!creator) {
+    return res.status(404).json({ error: 'Creator account not found' });
+  }
+  if (!creator.is_active) {
+    return res.status(403).json({ error: 'Creator account is disabled' });
+  }
+
+  // Normalize participants into a flat list of { account_id, amountCents }
+  let shareRows;
+  if (split_type === 'EQUAL') {
+    const accountIds = participants.map(p => (typeof p === 'string' ? p : p.account_id));
+    if (new Set(accountIds).size !== accountIds.length) {
+      return res.status(400).json({ error: 'Duplicate participants are not allowed' });
+    }
+    const n = accountIds.length;
+    const base = Math.floor(totalCents / n);
+    const remainder = totalCents - base * n;
+    // Distribute the leftover cents (from integer division) one at a time
+    // across the first `remainder` participants so shares always sum exactly
+    // to totalCents.
+    shareRows = accountIds.map((account_id, i) => ({
+      account_id,
+      amountCents: base + (i < remainder ? 1 : 0)
+    }));
+  } else {
+    if (participants.some(p => typeof p !== 'object' || !p.account_id || p.amount === undefined)) {
+      return res.status(400).json({ error: 'CUSTOM participants must each have account_id and amount' });
+    }
+    const accountIds = participants.map(p => p.account_id);
+    if (new Set(accountIds).size !== accountIds.length) {
+      return res.status(400).json({ error: 'Duplicate participants are not allowed' });
+    }
+    shareRows = participants.map(p => ({
+      account_id: p.account_id,
+      amountCents: Math.round(Number(p.amount) * 100)
+    }));
+    if (shareRows.some(s => !Number.isFinite(s.amountCents) || s.amountCents <= 0)) {
+      return res.status(400).json({ error: 'Each participant amount must be a positive number' });
+    }
+    const sum = shareRows.reduce((acc, s) => acc + s.amountCents, 0);
+    if (sum !== totalCents) {
+      return res.status(400).json({
+        error: `Custom shares must add up to the total. Shares sum to $${(sum / 100).toFixed(2)}, total is $${(totalCents / 100).toFixed(2)}.`
+      });
+    }
+  }
+
+  // Validate every participant account exists and is active.
+  for (const s of shareRows) {
+    const acc = db.prepare('SELECT * FROM accounts WHERE id = ?').get(s.account_id);
+    if (!acc) {
+      return res.status(404).json({ error: `Participant account not found: ${s.account_id}` });
+    }
+    if (!acc.is_active) {
+      return res.status(403).json({ error: `Participant account is disabled: ${acc.owner_name}` });
+    }
+  }
+
+  const splitId = uuidv4();
+  const timestamp = now();
+
+  const runCreate = db.transaction(() => {
+    db.prepare(`
+      INSERT INTO splits (id, creator_account_id, category, payee, total_cents, split_type, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(splitId, creator_account_id, category, payee.trim(), totalCents, split_type, timestamp);
+
+    const insertShare = db.prepare(`
+      INSERT INTO split_shares (id, split_id, account_id, amount_cents, status, expense_id, created_at)
+      VALUES (?, ?, ?, ?, 'PENDING', NULL, ?)
+    `);
+    shareRows.forEach(s => {
+      insertShare.run(uuidv4(), splitId, s.account_id, s.amountCents, timestamp);
+    });
+  });
+  runCreate();
+
+  return res.status(201).json(getSplitWithShares(splitId));
+});
+
+// ---------- POST /splits/:splitId/shares/:shareId/pay ----------
+// Body: { payee } — "what are you paying for" is asked again here per your spec,
+// since this becomes that person's own independent expense record.
+// Logs a normal expense on the paying participant's own account (same category
+// as the split), which is what makes it count against their own budget. No money
+// moves between participants — this is not a transfer.
+app.post('/splits/:splitId/shares/:shareId/pay', (req, res) => {
+  const { splitId, shareId } = req.params;
+  const { payee } = req.body;
+
+  if (!payee || !payee.trim()) {
+    return res.status(400).json({ error: 'payee is required (what are you paying for)' });
+  }
+
+  const split = db.prepare('SELECT * FROM splits WHERE id = ?').get(splitId);
+  if (!split) {
+    return res.status(404).json({ error: 'Split not found' });
+  }
+  const share = db.prepare('SELECT * FROM split_shares WHERE id = ? AND split_id = ?').get(shareId, splitId);
+  if (!share) {
+    return res.status(404).json({ error: 'Share not found on this split' });
+  }
+  if (share.status === 'PAID') {
+    return res.status(409).json({ error: 'This share has already been paid' });
+  }
+
+  try {
+    const expense = createExpenseInternal({
+      account_id: share.account_id,
+      category: split.category,
+      amountCents: share.amount_cents,
+      payee: payee.trim()
+    });
+
+    db.prepare(`UPDATE split_shares SET status = 'PAID', expense_id = ? WHERE id = ?`)
+      .run(expense.id, shareId);
+
+    return res.status(200).json(getSplitWithShares(splitId));
+  } catch (err) {
+    const statusCode = err.code === 'NOT_FOUND' ? 404
+      : err.code === 'ACCOUNT_INACTIVE' ? 403
+      : err.code === 'INSUFFICIENT_FUNDS' ? 422
+      : 500;
+    return res.status(statusCode).json({ error: err.message || 'Could not pay this share' });
+  }
 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));

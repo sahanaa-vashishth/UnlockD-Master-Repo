@@ -51,6 +51,27 @@ interface Budget {
   goal_reached: boolean
 }
 
+interface SplitShare {
+  id: string
+  split_id: string
+  account_id: string
+  owner_name: string
+  amount: number
+  status: 'PENDING' | 'PAID'
+  expense_id: string | null
+}
+
+interface Split {
+  id: string
+  creator_account_id: string
+  category: string
+  payee: string
+  total: number
+  split_type: 'EQUAL' | 'CUSTOM'
+  created_at: string
+  shares: SplitShare[]
+}
+
 const DEFAULT_SPEND_CATEGORIES = ['Food', 'Entertainment', 'Miscellaneous']
 const RESERVED_CATEGORY = 'Savings'
 
@@ -132,6 +153,26 @@ function App() {
   const [compareError, setCompareError] = useState<string | null>(null)
   const [compareRefreshKey, setCompareRefreshKey] = useState(0)
 
+  // ---- Split a bill (Feature 3) ----
+  const [splits, setSplits] = useState<Split[]>([])
+  const [showNewSplit, setShowNewSplit] = useState(false)
+  const [splitCategory, setSplitCategory] = useState<string>('Food')
+  const [splitNewCategory, setSplitNewCategory] = useState(false)
+  const [splitNewCategoryName, setSplitNewCategoryName] = useState('')
+  const [splitPayee, setSplitPayee] = useState('')
+  const [splitTotal, setSplitTotal] = useState('')
+  const [splitType, setSplitType] = useState<'EQUAL' | 'CUSTOM'>('EQUAL')
+  const [selectedParticipants, setSelectedParticipants] = useState<Record<string, boolean>>({})
+  const [customAmounts, setCustomAmounts] = useState<Record<string, string>>({})
+  const [creatingSplit, setCreatingSplit] = useState(false)
+  const [splitMessage, setSplitMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+
+  // Paying one pending share
+  const [payingShare, setPayingShare] = useState<{ splitId: string; shareId: string } | null>(null)
+  const [payPayeeInput, setPayPayeeInput] = useState('')
+  const [payingBusy, setPayingBusy] = useState(false)
+  const [payMessage, setPayMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+
   const loadData = useCallback(async (preferAccountId?: string) => {
     const [accRes, txRes] = await Promise.all([
       fetch(`${API_BASE}/accounts`),
@@ -167,6 +208,15 @@ function App() {
     setBudgets(budData.budgets)
     const catData = await catRes.json()
     setCategories(catData.spend_categories)
+  }, [])
+
+  const loadSplits = useCallback(async (accountId: string) => {
+    if (!accountId) {
+      setSplits([])
+      return
+    }
+    const res = await fetch(`${API_BASE}/splits?account_id=${accountId}`)
+    setSplits(await res.json())
   }, [])
 
   const fetchBudgetsForMonth = useCallback(async (accountId: string, month: string): Promise<Budget[]> => {
@@ -208,22 +258,51 @@ function App() {
   }, [loadData])
 
   useEffect(() => {
-    if (activeAccountId) loadBudgetingData(activeAccountId)
-  }, [activeAccountId, loadBudgetingData])
+    if (activeAccountId) {
+      loadBudgetingData(activeAccountId)
+      loadSplits(activeAccountId)
+    }
+  }, [activeAccountId, loadBudgetingData, loadSplits])
 
   const activeAccount = accounts.find(a => a.id === activeAccountId)
 
   const otherAccounts = accounts.filter(a => a.id !== activeAccountId && a.is_active)
 
+  const activeAccounts = accounts.filter(a => a.is_active)
+
   const accountTransactions = transactions.filter(
     tx => tx.from_account_id === activeAccountId || tx.to_account_id === activeAccountId
   )
+
+  // All PENDING shares belonging to the active account, across every split
+  // they're part of (whether they created it or were added to it).
+  const myPendingShares = splits.flatMap(s =>
+    s.shares
+      .filter(sh => sh.account_id === activeAccountId && sh.status === 'PENDING')
+      .map(sh => ({ split: s, share: sh }))
+  )
+
+  // Splits the active account created — for the live status view.
+  const mySplits = splits.filter(s => s.creator_account_id === activeAccountId)
 
   useEffect(() => {
     if (toAccountId && !otherAccounts.some(a => a.id === toAccountId)) {
       setToAccountId('')
     }
   }, [otherAccounts, toAccountId])
+
+  // Keep the participant checkbox list sane if accounts change while the
+  // new-split form is open (e.g. an account gets disabled).
+  useEffect(() => {
+    setSelectedParticipants(prev => {
+      const next: Record<string, boolean> = {}
+      activeAccounts.forEach(a => {
+        if (prev[a.id]) next[a.id] = true
+      })
+      return next
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accounts.length])
 
   async function handleTransfer(e: React.FormEvent) {
     e.preventDefault()
@@ -477,6 +556,126 @@ function App() {
     }
   }
 
+  function toggleParticipant(accountId: string) {
+    setSelectedParticipants(prev => ({ ...prev, [accountId]: !prev[accountId] }))
+  }
+
+  async function handleCreateSplit(e: React.FormEvent) {
+    e.preventDefault()
+    setSplitMessage(null)
+
+    const effectiveCategory = splitNewCategory ? splitNewCategoryName.trim() : splitCategory
+    const chosenIds = Object.keys(selectedParticipants).filter(id => selectedParticipants[id])
+
+    if (!splitPayee.trim() || !splitTotal) {
+      setSplitMessage({ type: 'error', text: 'Enter who was paid and the total amount.' })
+      return
+    }
+    if (!effectiveCategory) {
+      setSplitMessage({ type: 'error', text: 'Enter a category name.' })
+      return
+    }
+    if (chosenIds.length === 0) {
+      setSplitMessage({ type: 'error', text: 'Select at least one person to split with.' })
+      return
+    }
+
+    let participantsPayload: unknown
+    if (splitType === 'EQUAL') {
+      participantsPayload = chosenIds
+    } else {
+      const withAmounts = chosenIds.map(id => ({ account_id: id, amount: Number(customAmounts[id] || '0') }))
+      if (withAmounts.some(p => !p.amount || p.amount <= 0)) {
+        setSplitMessage({ type: 'error', text: 'Enter a positive amount for every selected person.' })
+        return
+      }
+      participantsPayload = withAmounts
+    }
+
+    setCreatingSplit(true)
+    try {
+      const res = await fetch(`${API_BASE}/splits`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          creator_account_id: activeAccountId,
+          category: effectiveCategory,
+          payee: splitPayee.trim(),
+          total: Number(splitTotal),
+          split_type: splitType,
+          participants: participantsPayload,
+        }),
+      })
+      const data = await res.json()
+
+      if (!res.ok) {
+        setSplitMessage({ type: 'error', text: data.error || 'Could not create split.' })
+      } else {
+        setSplitMessage({ type: 'success', text: `Split created for $${formatMoney(Number(splitTotal))} across ${chosenIds.length} people.` })
+        setSplitPayee('')
+        setSplitTotal('')
+        setSelectedParticipants({})
+        setCustomAmounts({})
+        if (splitNewCategory) {
+          setSplitCategory(effectiveCategory)
+          setSplitNewCategory(false)
+          setSplitNewCategoryName('')
+        }
+        setShowNewSplit(false)
+        await loadSplits(activeAccountId)
+      }
+    } catch {
+      setSplitMessage({ type: 'error', text: 'Could not reach the server. Is the backend running?' })
+    } finally {
+      setCreatingSplit(false)
+    }
+  }
+
+  function openPayShare(splitId: string, shareId: string) {
+    setPayMessage(null)
+    setPayPayeeInput('')
+    setPayingShare({ splitId, shareId })
+  }
+
+  async function handlePayShare(e: React.FormEvent) {
+    e.preventDefault()
+    if (!payingShare) return
+    setPayMessage(null)
+
+    if (!payPayeeInput.trim()) {
+      setPayMessage({ type: 'error', text: 'Enter what you\'re paying for.' })
+      return
+    }
+
+    setPayingBusy(true)
+    try {
+      const res = await fetch(
+        `${API_BASE}/splits/${payingShare.splitId}/shares/${payingShare.shareId}/pay`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ payee: payPayeeInput.trim() }),
+        }
+      )
+      const data = await res.json()
+
+      if (!res.ok) {
+        setPayMessage({ type: 'error', text: data.error || 'Could not pay this share.' })
+      } else {
+        setPayingShare(null)
+        setPayPayeeInput('')
+        await loadData(activeAccountId)
+        await loadBudgetingData(activeAccountId)
+        await loadSplits(activeAccountId)
+        setCompareRefreshKey(k => k + 1)
+      }
+    } catch {
+      setPayMessage({ type: 'error', text: 'Could not reach the server. Is the backend running?' })
+    } finally {
+      setPayingBusy(false)
+    }
+  }
+
   return (
     <>
       <header className="topbar">
@@ -618,6 +817,266 @@ function App() {
 
       <section className="main-grid" style={{ marginTop: 24 }}>
         <div className="transfer-card">
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <h2 style={{ margin: 0 }}>Split a bill</h2>
+            <button
+              type="button"
+              className="new-account-btn"
+              onClick={() => { setSplitMessage(null); setShowNewSplit(s => !s) }}
+              disabled={!activeAccount?.is_active}
+            >
+              {showNewSplit ? 'Cancel' : '+ New split'}
+            </button>
+          </div>
+
+          {showNewSplit && (
+            <form onSubmit={handleCreateSplit} style={{ marginTop: 16 }}>
+              <div className="field">
+                <label htmlFor="split-category">Category</label>
+                <select
+                  id="split-category"
+                  value={splitNewCategory ? '__new__' : splitCategory}
+                  onChange={e => {
+                    if (e.target.value === '__new__') {
+                      setSplitNewCategory(true)
+                    } else {
+                      setSplitNewCategory(false)
+                      setSplitCategory(e.target.value)
+                    }
+                  }}
+                >
+                  {categories.map(c => <option key={c} value={c}>{c}</option>)}
+                  <option value="__new__">+ Add new category…</option>
+                </select>
+                {splitNewCategory && (
+                  <input
+                    type="text"
+                    placeholder="e.g. Trip, Groceries"
+                    value={splitNewCategoryName}
+                    onChange={e => setSplitNewCategoryName(e.target.value)}
+                    style={{ marginTop: 8 }}
+                    autoFocus
+                  />
+                )}
+              </div>
+
+              <div className="field">
+                <label htmlFor="split-payee">Paid to</label>
+                <input
+                  id="split-payee"
+                  type="text"
+                  placeholder="e.g. restaurant, cab driver"
+                  value={splitPayee}
+                  onChange={e => setSplitPayee(e.target.value)}
+                />
+              </div>
+
+              <div className="field">
+                <label htmlFor="split-total">Total amount (USD)</label>
+                <input
+                  id="split-total"
+                  type="number"
+                  min="0.01"
+                  step="0.01"
+                  placeholder="0.00"
+                  value={splitTotal}
+                  onChange={e => setSplitTotal(e.target.value)}
+                />
+              </div>
+
+              <div className="field">
+                <label>How to split</label>
+                <div style={{ display: 'flex', gap: 16, marginTop: 4 }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 400 }}>
+                    <input
+                      type="radio"
+                      name="split-type"
+                      checked={splitType === 'EQUAL'}
+                      onChange={() => setSplitType('EQUAL')}
+                    />
+                    Equally
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 400 }}>
+                    <input
+                      type="radio"
+                      name="split-type"
+                      checked={splitType === 'CUSTOM'}
+                      onChange={() => setSplitType('CUSTOM')}
+                    />
+                    According to what you bought
+                  </label>
+                </div>
+              </div>
+
+              <div className="field">
+                <label>Split with</label>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 4 }}>
+                  {activeAccounts.map(acc => (
+                    <div key={acc.id} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 400, flex: 1 }}>
+                        <input
+                          type="checkbox"
+                          checked={!!selectedParticipants[acc.id]}
+                          onChange={() => toggleParticipant(acc.id)}
+                        />
+                        {acc.owner_name}{acc.id === activeAccountId ? ' (you)' : ''}
+                      </label>
+                      {splitType === 'CUSTOM' && selectedParticipants[acc.id] && (
+                        <input
+                          type="number"
+                          min="0.01"
+                          step="0.01"
+                          placeholder="0.00"
+                          value={customAmounts[acc.id] || ''}
+                          onChange={e => setCustomAmounts(prev => ({ ...prev, [acc.id]: e.target.value }))}
+                          style={{ width: 100 }}
+                        />
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <button className="send-btn" type="submit" disabled={creatingSplit}>
+                {creatingSplit ? 'Creating…' : 'Create split'}
+              </button>
+              {splitMessage && (
+                <div className={`form-message ${splitMessage.type}`}>{splitMessage.text}</div>
+              )}
+            </form>
+          )}
+
+          {!showNewSplit && (
+            <>
+              <h3 style={{ fontSize: '0.95rem', marginTop: 16, marginBottom: 8, color: '#666' }}>
+                Your pending payments
+              </h3>
+              {myPendingShares.length === 0 && (
+                <div className="empty-state">Nothing pending — you're all settled up.</div>
+              )}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                {myPendingShares.map(({ split, share }) => (
+                  <div key={share.id} style={{ padding: '10px 14px', border: '1px solid #e5e1d8', borderRadius: 8 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <div>
+                        <strong>{split.category}</strong> — {split.payee}
+                        <div style={{ fontSize: '0.8rem', color: '#666' }}>
+                          Your share: ${formatMoney(share.amount)}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className="send-btn"
+                        onClick={() => openPayShare(split.id, share.id)}
+                        style={{ padding: '6px 14px', fontSize: '0.85rem' }}
+                      >
+                        Pay
+                      </button>
+                    </div>
+
+                    {payingShare?.splitId === split.id && payingShare?.shareId === share.id && (
+                      <form onSubmit={handlePayShare} style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid #eee' }}>
+                        <div className="field">
+                          <label htmlFor={`pay-payee-${share.id}`}>What are you paying for?</label>
+                          <input
+                            id={`pay-payee-${share.id}`}
+                            type="text"
+                            placeholder="e.g. my share of dinner"
+                            value={payPayeeInput}
+                            onChange={e => setPayPayeeInput(e.target.value)}
+                            autoFocus
+                          />
+                        </div>
+                        <div style={{ display: 'flex', gap: 8 }}>
+                          <button className="send-btn" type="submit" disabled={payingBusy} style={{ flex: 1 }}>
+                            {payingBusy ? 'Paying…' : `Pay $${formatMoney(share.amount)}`}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setPayingShare(null)}
+                            style={{ flex: 1, background: '#eee', border: 'none', borderRadius: 6, cursor: 'pointer' }}
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                        {payMessage && (
+                          <div className={`form-message ${payMessage.type}`}>{payMessage.text}</div>
+                        )}
+                      </form>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              <h3 style={{ fontSize: '0.95rem', marginTop: 20, marginBottom: 8, color: '#666' }}>
+                Splits you created
+              </h3>
+              {mySplits.length === 0 && (
+                <div className="empty-state">You haven't created any splits yet.</div>
+              )}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                {mySplits.map(split => (
+                  <div key={split.id} style={{ padding: '10px 14px', border: '1px solid #e5e1d8', borderRadius: 8 }}>
+                    <div style={{ marginBottom: 6 }}>
+                      <strong>{split.category}</strong> — {split.payee} · ${formatMoney(split.total)} total
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      {split.shares.map(sh => (
+                        <div key={sh.id} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85rem' }}>
+                          <span>{sh.owner_name}{sh.account_id === activeAccountId ? ' (you)' : ''} — ${formatMoney(sh.amount)}</span>
+                          <span className={`status-badge ${sh.status === 'PAID' ? 'SUCCESS' : 'PENDING'}`}>{sh.status}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+
+        <div className="transfer-card">
+          <h2>Savings</h2>
+          <div className="field">
+            <label htmlFor="savings-amount">Amount (USD)</label>
+            <input
+              id="savings-amount"
+              type="number"
+              min="0.01"
+              step="0.01"
+              placeholder="0.00"
+              value={savingsAmount}
+              onChange={e => setSavingsAmount(e.target.value)}
+            />
+          </div>
+          <div style={{ display: 'flex', gap: 12 }}>
+            <button
+              type="button"
+              className="send-btn"
+              onClick={() => handleSavingsMove('contribute')}
+              disabled={savingsBusy || !activeAccount?.is_active}
+              style={{ flex: 1 }}
+            >
+              {savingsBusy ? 'Working…' : 'Add to savings'}
+            </button>
+            <button
+              type="button"
+              className="send-btn"
+              onClick={() => handleSavingsMove('withdraw')}
+              disabled={savingsBusy || !activeAccount?.is_active}
+              style={{ flex: 1, background: '#7a7a7a' }}
+            >
+              {savingsBusy ? 'Working…' : 'Withdraw (emergency)'}
+            </button>
+          </div>
+          {savingsMessage && (
+            <div className={`form-message ${savingsMessage.type}`}>{savingsMessage.text}</div>
+          )}
+        </div>
+      </section>
+
+      <section className="main-grid" style={{ marginTop: 24 }}>
+        <div className="transfer-card">
           <h2>Log an expense</h2>
           <form onSubmit={handleLogExpense}>
             <div className="field">
@@ -680,49 +1139,9 @@ function App() {
         </div>
 
         <div className="transfer-card">
-          <h2>Savings</h2>
-          <div className="field">
-            <label htmlFor="savings-amount">Amount (USD)</label>
-            <input
-              id="savings-amount"
-              type="number"
-              min="0.01"
-              step="0.01"
-              placeholder="0.00"
-              value={savingsAmount}
-              onChange={e => setSavingsAmount(e.target.value)}
-            />
-          </div>
-          <div style={{ display: 'flex', gap: 12 }}>
-            <button
-              type="button"
-              className="send-btn"
-              onClick={() => handleSavingsMove('contribute')}
-              disabled={savingsBusy || !activeAccount?.is_active}
-              style={{ flex: 1 }}
-            >
-              {savingsBusy ? 'Working…' : 'Add to savings'}
-            </button>
-            <button
-              type="button"
-              className="send-btn"
-              onClick={() => handleSavingsMove('withdraw')}
-              disabled={savingsBusy || !activeAccount?.is_active}
-              style={{ flex: 1, background: '#7a7a7a' }}
-            >
-              {savingsBusy ? 'Working…' : 'Withdraw (emergency)'}
-            </button>
-          </div>
-          {savingsMessage && (
-            <div className={`form-message ${savingsMessage.type}`}>{savingsMessage.text}</div>
-          )}
-        </div>
-      </section>
+          <h2>Budgets{activeAccount && <span className="ledger-subtitle"> — {activeAccount.owner_name}</span>}</h2>
 
-      <section className="ledger-section" style={{ marginTop: 24 }}>
-        <h2>Budgets{activeAccount && <span className="ledger-subtitle"> — {activeAccount.owner_name}</span>}</h2>
-
-        <form onSubmit={handleSetBudget} className="new-account-form" style={{ marginBottom: 20 }}>
+          <form onSubmit={handleSetBudget} style={{ marginBottom: 20 }}>
           <div className="field">
             <label htmlFor="budget-category">Category</label>
             <select
@@ -830,6 +1249,7 @@ function App() {
               </div>
             )
           })}
+          </div>
         </div>
       </section>
 

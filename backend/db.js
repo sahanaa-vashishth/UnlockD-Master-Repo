@@ -64,6 +64,37 @@ db.exec(`
     amount_cents INTEGER NOT NULL,
     created_at TEXT NOT NULL
   );
+
+  -- Feature 3: Split a bill.
+  -- A split is a "template" — total amount, category, who was paid (shopkeeper,
+  -- cab driver, etc.), split type, and who created it. Each participant (including
+  -- the creator) gets their own independent share row below. There are NO internal
+  -- transfers between participants — each share simply becomes that person's own
+  -- expense (hitting their own budget) once they pay it.
+  CREATE TABLE IF NOT EXISTS splits (
+    id TEXT PRIMARY KEY,
+    creator_account_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    payee TEXT NOT NULL,
+    total_cents INTEGER NOT NULL,
+    split_type TEXT NOT NULL CHECK(split_type IN ('EQUAL','CUSTOM')),
+    created_at TEXT NOT NULL
+  );
+
+  -- One row per participant per split (creator included). status flips
+  -- PENDING -> PAID when that person logs their own expense for their share.
+  -- expense_id links to the resulting expenses row once paid, so it's easy to
+  -- trace and stays fully consistent with normal budget tracking.
+  CREATE TABLE IF NOT EXISTS split_shares (
+    id TEXT PRIMARY KEY,
+    split_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('PENDING','PAID')) DEFAULT 'PENDING',
+    expense_id TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (split_id) REFERENCES splits(id)
+  );
 `);
 
 // ---- Migrations for anyone upgrading an existing data.sqlite from earlier features ----
