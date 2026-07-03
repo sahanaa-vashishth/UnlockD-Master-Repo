@@ -7,6 +7,7 @@ interface Account {
   id: string
   owner_name: string
   balance: number
+  is_active: boolean
 }
 
 interface Transaction {
@@ -49,6 +50,8 @@ function App() {
   const [creating, setCreating] = useState(false)
   const [createMessage, setCreateMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
+  const [togglingStatus, setTogglingStatus] = useState(false)
+
   const loadData = useCallback(async (preferAccountId?: string) => {
     const [accRes, txRes] = await Promise.all([
       fetch(`${API_BASE}/accounts`),
@@ -61,7 +64,7 @@ function App() {
     setActiveAccountId(prev => {
       if (preferAccountId) return preferAccountId
       if (prev && accData.some(a => a.id === prev)) return prev
-      return accData[0]?.id ?? ''
+      return accData.find(a => a.is_active)?.id ?? accData[0]?.id ?? ''
     })
   }, [])
 
@@ -70,7 +73,22 @@ function App() {
   }, [loadData])
 
   const activeAccount = accounts.find(a => a.id === activeAccountId)
-  const otherAccounts = accounts.filter(a => a.id !== activeAccountId)
+
+  // Recipients must be a different account AND currently active.
+  const otherAccounts = accounts.filter(a => a.id !== activeAccountId && a.is_active)
+
+  // Only show transactions where the active account was sender or receiver.
+  const accountTransactions = transactions.filter(
+    tx => tx.from_account_id === activeAccountId || tx.to_account_id === activeAccountId
+  )
+
+  // If the account picked as "To" gets disabled or disappears, clear the selection
+  // instead of silently letting a stale value sit in the field.
+  useEffect(() => {
+    if (toAccountId && !otherAccounts.some(a => a.id === toAccountId)) {
+      setToAccountId('')
+    }
+  }, [otherAccounts, toAccountId])
 
   async function handleTransfer(e: React.FormEvent) {
     e.preventDefault()
@@ -99,6 +117,7 @@ function App() {
       } else {
         setMessage({ type: 'success', text: `Sent $${formatMoney(Number(amount))} successfully.` })
         setAmount('')
+        setToAccountId('')
         await loadData(activeAccountId)
       }
     } catch {
@@ -135,12 +154,37 @@ function App() {
         setNewAccountName('')
         setNewAccountBalance('')
         setShowNewAccount(false)
+        // Explicitly refetch and switch to the new account so it shows up everywhere immediately,
+        // including in the "Send to" dropdown for whichever account was active before.
         await loadData(data.id)
       }
     } catch {
       setCreateMessage({ type: 'error', text: 'Could not reach the server. Is the backend running?' })
     } finally {
       setCreating(false)
+    }
+  }
+
+  async function handleToggleActive() {
+    if (!activeAccount) return
+    setTogglingStatus(true)
+    setMessage(null)
+    try {
+      const res = await fetch(`${API_BASE}/accounts/${activeAccount.id}/status`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_active: !activeAccount.is_active }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setMessage({ type: 'error', text: data.error || 'Could not update account status.' })
+      } else {
+        await loadData(activeAccount.id)
+      }
+    } catch {
+      setMessage({ type: 'error', text: 'Could not reach the server. Is the backend running?' })
+    } finally {
+      setTogglingStatus(false)
     }
   }
 
@@ -158,8 +202,10 @@ function App() {
                   key={acc.id}
                   className={acc.id === activeAccountId ? 'active' : ''}
                   onClick={() => setActiveAccountId(acc.id)}
+                  title={acc.is_active ? '' : 'Disabled account'}
                 >
                   {acc.owner_name}
+                  {!acc.is_active && ' (disabled)'}
                 </button>
               ))}
             </div>
@@ -208,10 +254,30 @@ function App() {
       <section className="main-grid">
         <div className="balance-card">
           <div>
-            <div className="label">Current balance</div>
+            <div className="label">
+              Current balance {activeAccount && !activeAccount.is_active && (
+                <span className="status-badge FAILED" style={{ marginLeft: 8 }}>DISABLED</span>
+              )}
+            </div>
             <div className="amount">${activeAccount ? formatMoney(activeAccount.balance) : '—'}</div>
           </div>
-          <div className="owner">{activeAccount?.owner_name ?? 'Loading…'}</div>
+          <div className="owner-row">
+            <div className="owner">{activeAccount?.owner_name ?? 'Loading…'}</div>
+            {activeAccount && (
+              <button
+                type="button"
+                className="toggle-status-btn"
+                onClick={handleToggleActive}
+                disabled={togglingStatus}
+              >
+                {togglingStatus
+                  ? 'Updating…'
+                  : activeAccount.is_active
+                    ? 'Disable account'
+                    : 'Re-enable account'}
+              </button>
+            )}
+          </div>
         </div>
 
         <div className="transfer-card">
@@ -238,9 +304,18 @@ function App() {
                 onChange={e => setAmount(e.target.value)}
               />
             </div>
-            <button className="send-btn" type="submit" disabled={sending}>
+            <button
+              className="send-btn"
+              type="submit"
+              disabled={sending || !activeAccount?.is_active}
+            >
               {sending ? 'Sending…' : 'Send transfer'}
             </button>
+            {activeAccount && !activeAccount.is_active && (
+              <div className="form-message error">
+                This account is disabled and cannot send transfers.
+              </div>
+            )}
             {message && (
               <div className={`form-message ${message.type}`}>{message.text}</div>
             )}
@@ -249,7 +324,10 @@ function App() {
       </section>
 
       <section className="ledger-section">
-        <h2>Transaction ledger</h2>
+        <h2>
+          Transaction ledger
+          {activeAccount && <span className="ledger-subtitle"> — {activeAccount.owner_name}</span>}
+        </h2>
         <div className="ledger">
           <div className="ledger-row head">
             <span>Date</span>
@@ -257,10 +335,14 @@ function App() {
             <span>Amount</span>
             <span>Status</span>
           </div>
-          {transactions.length === 0 && (
-            <div className="empty-state">No transactions yet — send your first transfer above.</div>
+          {accountTransactions.length === 0 && (
+            <div className="empty-state">
+              {activeAccount
+                ? `No transactions yet for ${activeAccount.owner_name} — send a transfer above.`
+                : 'No transactions yet — send your first transfer above.'}
+            </div>
           )}
-          {transactions.map(tx => {
+          {accountTransactions.map(tx => {
             const isOutgoing = tx.from_account_id === activeAccountId
             const fromName = accounts.find(a => a.id === tx.from_account_id)?.owner_name ?? tx.from_account_id
             const toName = accounts.find(a => a.id === tx.to_account_id)?.owner_name ?? tx.to_account_id

@@ -10,7 +10,8 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS accounts (
     id TEXT PRIMARY KEY,
     owner_name TEXT NOT NULL,
-    balance_cents INTEGER NOT NULL DEFAULT 0
+    balance_cents INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1
   );
 
   CREATE TABLE IF NOT EXISTS transactions (
@@ -26,11 +27,17 @@ db.exec(`
   );
 `);
 
+// Migration: add is_active if upgrading from an older schema that doesn't have it yet.
+const cols = db.prepare("PRAGMA table_info(accounts)").all();
+if (!cols.some(c => c.name === 'is_active')) {
+  db.exec('ALTER TABLE accounts ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1');
+}
+
 // Seed two demo accounts if empty, so you can test transfers immediately.
 const count = db.prepare('SELECT COUNT(*) AS c FROM accounts').get().c;
 if (count === 0) {
   const seed = db.prepare(
-    'INSERT INTO accounts (id, owner_name, balance_cents) VALUES (?, ?, ?)'
+    'INSERT INTO accounts (id, owner_name, balance_cents, is_active) VALUES (?, ?, ?, 1)'
   );
   seed.run('acc_alice', 'Alice', 100000); // $1000.00
   seed.run('acc_bob', 'Bob', 50000);      // $500.00

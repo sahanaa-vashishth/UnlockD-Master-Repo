@@ -15,7 +15,8 @@ app.get('/accounts', (req, res) => {
   res.json(rows.map(a => ({
     id: a.id,
     owner_name: a.owner_name,
-    balance: a.balance_cents / 100
+    balance: a.balance_cents / 100,
+    is_active: !!a.is_active
   })));
 });
 
@@ -35,13 +36,41 @@ app.post('/accounts', (req, res) => {
 
   const id = 'acc_' + owner_name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_') + '_' + Date.now().toString(36);
 
-  db.prepare('INSERT INTO accounts (id, owner_name, balance_cents) VALUES (?, ?, ?)')
+  db.prepare('INSERT INTO accounts (id, owner_name, balance_cents, is_active) VALUES (?, ?, ?, 1)')
     .run(id, owner_name.trim(), startingCents);
 
   return res.status(201).json({
     id,
     owner_name: owner_name.trim(),
-    balance: startingCents / 100
+    balance: startingCents / 100,
+    is_active: true
+  });
+});
+
+// ---------- PATCH /accounts/:id/status ----------
+// Body: { is_active: boolean }
+// Disables/re-enables an account without deleting it, so transaction history stays intact.
+app.patch('/accounts/:id/status', (req, res) => {
+  const { id } = req.params;
+  const { is_active } = req.body;
+
+  if (typeof is_active !== 'boolean') {
+    return res.status(400).json({ error: 'is_active must be true or false' });
+  }
+
+  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(id);
+  if (!account) {
+    return res.status(404).json({ error: 'Account not found' });
+  }
+
+  db.prepare('UPDATE accounts SET is_active = ? WHERE id = ?').run(is_active ? 1 : 0, id);
+
+  const updated = db.prepare('SELECT * FROM accounts WHERE id = ?').get(id);
+  return res.json({
+    id: updated.id,
+    owner_name: updated.owner_name,
+    balance: updated.balance_cents / 100,
+    is_active: !!updated.is_active
   });
 });
 
@@ -106,6 +135,9 @@ app.post('/transactions/transfer', (req, res) => {
     if (!fromAccount || !toAccount) {
       throw { code: 'NOT_FOUND', message: 'One or both accounts do not exist' };
     }
+    if (!fromAccount.is_active || !toAccount.is_active) {
+      throw { code: 'ACCOUNT_INACTIVE', message: 'One or both accounts are disabled' };
+    }
     if (fromAccount.balance_cents < amountCents) {
       throw { code: 'INSUFFICIENT_FUNDS', message: 'Insufficient balance for this transfer' };
     }
@@ -140,6 +172,7 @@ app.post('/transactions/transfer', (req, res) => {
     }
     const statusCode = err.code === 'NOT_FOUND' ? 404
       : err.code === 'INSUFFICIENT_FUNDS' ? 422
+      : err.code === 'ACCOUNT_INACTIVE' ? 403
       : 500;
     return res.status(statusCode).json({ error: reason });
   }
