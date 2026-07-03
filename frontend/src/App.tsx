@@ -51,8 +51,8 @@ interface Budget {
   goal_reached: boolean
 }
 
-const SPEND_CATEGORIES = ['Food', 'Entertainment', 'Miscellaneous'] as const
-const ALL_CATEGORIES = [...SPEND_CATEGORIES, 'Savings'] as const
+const DEFAULT_SPEND_CATEGORIES = ['Food', 'Entertainment', 'Miscellaneous']
+const RESERVED_CATEGORY = 'Savings'
 
 function currentMonthValue() {
   return new Date().toISOString().slice(0, 7) // "2026-07"
@@ -100,7 +100,10 @@ function App() {
   const [togglingStatus, setTogglingStatus] = useState(false)
 
   // Expense form
-  const [expenseCategory, setExpenseCategory] = useState<typeof SPEND_CATEGORIES[number]>('Food')
+  const [categories, setCategories] = useState<string[]>([...DEFAULT_SPEND_CATEGORIES])
+  const [expenseCategory, setExpenseCategory] = useState<string>('Food')
+  const [expenseNewCategory, setExpenseNewCategory] = useState(false)
+  const [expenseNewCategoryName, setExpenseNewCategoryName] = useState('')
   const [expenseAmount, setExpenseAmount] = useState('')
   const [expensePayee, setExpensePayee] = useState('')
   const [loggingExpense, setLoggingExpense] = useState(false)
@@ -112,10 +115,13 @@ function App() {
   const [savingsMessage, setSavingsMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
   // Budget form
-  const [budgetCategory, setBudgetCategory] = useState<typeof ALL_CATEGORIES[number]>('Food')
+  const [budgetCategory, setBudgetCategory] = useState<string>('Food')
+  const [budgetNewCategory, setBudgetNewCategory] = useState(false)
+  const [budgetNewCategoryName, setBudgetNewCategoryName] = useState('')
   const [budgetLimit, setBudgetLimit] = useState('')
   const [savingBudget, setSavingBudget] = useState(false)
   const [budgetMessage, setBudgetMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [deletingBudgetId, setDeletingBudgetId] = useState<string | null>(null)
 
   // Budget calendar — compare any two months (past, current, or future)
   const [monthA, setMonthA] = useState<string>(currentMonthValue())
@@ -149,15 +155,18 @@ function App() {
       setBudgets([])
       return
     }
-    const [expRes, savRes, budRes] = await Promise.all([
+    const [expRes, savRes, budRes, catRes] = await Promise.all([
       fetch(`${API_BASE}/expenses?account_id=${accountId}`),
       fetch(`${API_BASE}/savings/transactions?account_id=${accountId}`),
       fetch(`${API_BASE}/budgets?account_id=${accountId}`),
+      fetch(`${API_BASE}/categories?account_id=${accountId}`),
     ])
     setExpenses(await expRes.json())
     setSavingsTxs(await savRes.json())
     const budData = await budRes.json()
     setBudgets(budData.budgets)
+    const catData = await catRes.json()
+    setCategories(catData.spend_categories)
   }, [])
 
   const fetchBudgetsForMonth = useCallback(async (accountId: string, month: string): Promise<Budget[]> => {
@@ -316,8 +325,14 @@ function App() {
     e.preventDefault()
     setExpenseMessage(null)
 
+    const effectiveCategory = expenseNewCategory ? expenseNewCategoryName.trim() : expenseCategory
+
     if (!expenseAmount || !expensePayee.trim()) {
       setExpenseMessage({ type: 'error', text: 'Enter an amount and who you paid.' })
+      return
+    }
+    if (!effectiveCategory) {
+      setExpenseMessage({ type: 'error', text: 'Enter a category name.' })
       return
     }
 
@@ -328,7 +343,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           account_id: activeAccountId,
-          category: expenseCategory,
+          category: effectiveCategory,
           amount: Number(expenseAmount),
           payee: expensePayee.trim(),
         }),
@@ -338,9 +353,14 @@ function App() {
       if (!res.ok) {
         setExpenseMessage({ type: 'error', text: data.error || 'Could not log expense.' })
       } else {
-        setExpenseMessage({ type: 'success', text: `Logged $${formatMoney(Number(expenseAmount))} to ${expenseCategory}.` })
+        setExpenseMessage({ type: 'success', text: `Logged $${formatMoney(Number(expenseAmount))} to ${effectiveCategory}.` })
         setExpenseAmount('')
         setExpensePayee('')
+        if (expenseNewCategory) {
+          setExpenseCategory(effectiveCategory)
+          setExpenseNewCategory(false)
+          setExpenseNewCategoryName('')
+        }
         await loadData(activeAccountId)
         await loadBudgetingData(activeAccountId)
         setCompareRefreshKey(k => k + 1)
@@ -393,8 +413,14 @@ function App() {
     e.preventDefault()
     setBudgetMessage(null)
 
+    const effectiveCategory = budgetNewCategory ? budgetNewCategoryName.trim() : budgetCategory
+
     if (!budgetLimit) {
       setBudgetMessage({ type: 'error', text: 'Enter a monthly limit.' })
+      return
+    }
+    if (!effectiveCategory) {
+      setBudgetMessage({ type: 'error', text: 'Enter a category name.' })
       return
     }
 
@@ -405,7 +431,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           account_id: activeAccountId,
-          category: budgetCategory,
+          category: effectiveCategory,
           monthly_limit: Number(budgetLimit),
         }),
       })
@@ -414,8 +440,13 @@ function App() {
       if (!res.ok) {
         setBudgetMessage({ type: 'error', text: data.error || 'Could not save budget.' })
       } else {
-        setBudgetMessage({ type: 'success', text: `${budgetCategory} budget set to $${formatMoney(Number(budgetLimit))}/month.` })
+        setBudgetMessage({ type: 'success', text: `${effectiveCategory} budget set to $${formatMoney(Number(budgetLimit))}/month.` })
         setBudgetLimit('')
+        if (budgetNewCategory) {
+          setBudgetCategory(effectiveCategory)
+          setBudgetNewCategory(false)
+          setBudgetNewCategoryName('')
+        }
         await loadBudgetingData(activeAccountId)
         setCompareRefreshKey(k => k + 1)
       }
@@ -423,6 +454,26 @@ function App() {
       setBudgetMessage({ type: 'error', text: 'Could not reach the server. Is the backend running?' })
     } finally {
       setSavingBudget(false)
+    }
+  }
+
+  async function handleDeleteBudget(budgetId: string, category: string) {
+    setBudgetMessage(null)
+    setDeletingBudgetId(budgetId)
+    try {
+      const res = await fetch(`${API_BASE}/budgets/${budgetId}`, { method: 'DELETE' })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        setBudgetMessage({ type: 'error', text: data.error || 'Could not delete budget.' })
+      } else {
+        setBudgetMessage({ type: 'success', text: `Deleted the ${category} budget. Past activity in that category is unaffected.` })
+        await loadBudgetingData(activeAccountId)
+        setCompareRefreshKey(k => k + 1)
+      }
+    } catch {
+      setBudgetMessage({ type: 'error', text: 'Could not reach the server. Is the backend running?' })
+    } finally {
+      setDeletingBudgetId(null)
     }
   }
 
@@ -573,11 +624,29 @@ function App() {
               <label htmlFor="expense-category">Category</label>
               <select
                 id="expense-category"
-                value={expenseCategory}
-                onChange={e => setExpenseCategory(e.target.value as typeof SPEND_CATEGORIES[number])}
+                value={expenseNewCategory ? '__new__' : expenseCategory}
+                onChange={e => {
+                  if (e.target.value === '__new__') {
+                    setExpenseNewCategory(true)
+                  } else {
+                    setExpenseNewCategory(false)
+                    setExpenseCategory(e.target.value)
+                  }
+                }}
               >
-                {SPEND_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+                {categories.map(c => <option key={c} value={c}>{c}</option>)}
+                <option value="__new__">+ Add new category…</option>
               </select>
+              {expenseNewCategory && (
+                <input
+                  type="text"
+                  placeholder="e.g. Dream Vacation, TV"
+                  value={expenseNewCategoryName}
+                  onChange={e => setExpenseNewCategoryName(e.target.value)}
+                  style={{ marginTop: 8 }}
+                  autoFocus
+                />
+              )}
             </div>
             <div className="field">
               <label htmlFor="expense-payee">Paid to</label>
@@ -658,15 +727,33 @@ function App() {
             <label htmlFor="budget-category">Category</label>
             <select
               id="budget-category"
-              value={budgetCategory}
-              onChange={e => setBudgetCategory(e.target.value as typeof ALL_CATEGORIES[number])}
+              value={budgetNewCategory ? '__new__' : budgetCategory}
+              onChange={e => {
+                if (e.target.value === '__new__') {
+                  setBudgetNewCategory(true)
+                } else {
+                  setBudgetNewCategory(false)
+                  setBudgetCategory(e.target.value)
+                }
+              }}
             >
-              {ALL_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+              {[...categories, RESERVED_CATEGORY].map(c => <option key={c} value={c}>{c}</option>)}
+              <option value="__new__">+ Add new category…</option>
             </select>
+            {budgetNewCategory && (
+              <input
+                type="text"
+                placeholder="e.g. Dream Vacation, TV"
+                value={budgetNewCategoryName}
+                onChange={e => setBudgetNewCategoryName(e.target.value)}
+                style={{ marginTop: 8 }}
+                autoFocus
+              />
+            )}
           </div>
           <div className="field">
             <label htmlFor="budget-limit">
-              {budgetCategory === 'Savings' ? 'Monthly savings goal (USD)' : 'Monthly limit (USD)'}
+              {(budgetNewCategory ? budgetNewCategoryName : budgetCategory) === RESERVED_CATEGORY ? 'Monthly savings goal (USD)' : 'Monthly limit (USD)'}
             </label>
             <input
               id="budget-limit"
@@ -700,12 +787,31 @@ function App() {
 
             return (
               <div key={b.id} style={{ padding: '14px 16px', border: '1px solid #e5e1d8', borderRadius: 8 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
                   <strong>{b.category}</strong>
-                  <span>
-                    ${formatMoney(b.spent)} / ${formatMoney(b.monthly_limit)}
-                    {isSavings ? ' saved' : ' spent'}
-                  </span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <span>
+                      ${formatMoney(b.spent)} / ${formatMoney(b.monthly_limit)}
+                      {isSavings ? ' saved' : ' spent'}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteBudget(b.id, b.category)}
+                      disabled={deletingBudgetId === b.id}
+                      title={`Delete ${b.category} budget`}
+                      style={{
+                        background: 'none',
+                        border: '1px solid #d9887e',
+                        color: '#b03a2e',
+                        borderRadius: 6,
+                        padding: '2px 8px',
+                        fontSize: '0.75rem',
+                        cursor: deletingBudgetId === b.id ? 'default' : 'pointer',
+                      }}
+                    >
+                      {deletingBudgetId === b.id ? 'Deleting…' : 'Delete'}
+                    </button>
+                  </div>
                 </div>
                 <div style={{ background: '#eee', borderRadius: 4, height: 8, overflow: 'hidden' }}>
                   <div style={{ width: `${pctForBar}%`, background: barColor, height: '100%' }} />

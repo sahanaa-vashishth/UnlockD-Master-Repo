@@ -10,8 +10,19 @@ app.use(express.json());
 const now = () => new Date().toISOString();
 const currentMonthPrefix = () => new Date().toISOString().slice(0, 7); // "2026-07"
 
-const SPEND_CATEGORIES = ['Food', 'Entertainment', 'Miscellaneous'];
-const ALL_CATEGORIES = [...SPEND_CATEGORIES, 'Savings'];
+// Default suggestions shown in the UI — not a restriction. Any non-empty name
+// is accepted (e.g. "Dream Vacation", "TV"), so budgets/expenses aren't locked
+// to a fixed list. 'Savings' is reserved: it's tracked via savings_transactions,
+// not the expenses table, so it can't be used as a plain spending category.
+const DEFAULT_SPEND_CATEGORIES = ['Food', 'Entertainment', 'Miscellaneous'];
+const RESERVED_CATEGORY = 'Savings';
+
+function normalizeCategory(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 40) return null;
+  return trimmed;
+}
 
 // ================== ACCOUNTS ==================
 
@@ -204,13 +215,14 @@ app.get('/expenses', (req, res) => {
 // ---------- POST /expenses ----------
 // Body: { account_id, category, amount, payee }
 app.post('/expenses', (req, res) => {
-  const { account_id, category, amount, payee } = req.body;
+  const { account_id, amount, payee } = req.body;
+  const category = normalizeCategory(req.body.category);
 
   if (!account_id || !category || amount === undefined || !payee || !payee.trim()) {
     return res.status(400).json({ error: 'account_id, category, amount and payee are required' });
   }
-  if (!SPEND_CATEGORIES.includes(category)) {
-    return res.status(400).json({ error: `category must be one of: ${SPEND_CATEGORIES.join(', ')}` });
+  if (category === RESERVED_CATEGORY) {
+    return res.status(400).json({ error: `"${RESERVED_CATEGORY}" is reserved — use the Savings contribute/withdraw endpoints instead` });
   }
   const amountCents = Math.round(Number(amount) * 100);
   if (!Number.isFinite(amountCents) || amountCents <= 0) {
@@ -396,13 +408,11 @@ app.get('/budgets', (req, res) => {
 // Body: { account_id, category, monthly_limit }
 // Upserts — setting a budget for a category that already has one just updates the limit.
 app.post('/budgets', (req, res) => {
-  const { account_id, category, monthly_limit } = req.body;
+  const { account_id, monthly_limit } = req.body;
+  const category = normalizeCategory(req.body.category);
 
   if (!account_id || !category || monthly_limit === undefined) {
     return res.status(400).json({ error: 'account_id, category and monthly_limit are required' });
-  }
-  if (!ALL_CATEGORIES.includes(category)) {
-    return res.status(400).json({ error: `category must be one of: ${ALL_CATEGORIES.join(', ')}` });
   }
   const limitCents = Math.round(Number(monthly_limit) * 100);
   if (!Number.isFinite(limitCents) || limitCents <= 0) {
@@ -433,6 +443,46 @@ app.post('/budgets', (req, res) => {
     account_id: saved.account_id,
     category: saved.category,
     monthly_limit: saved.monthly_limit_cents / 100
+  });
+});
+
+// ---------- DELETE /budgets/:id ----------
+// Removes the budget itself only. Past expenses/savings activity already
+// logged under that category is untouched — this just stops tracking a
+// monthly limit for it going forward.
+app.delete('/budgets/:id', (req, res) => {
+  const { id } = req.params;
+  const existing = db.prepare('SELECT * FROM budgets WHERE id = ?').get(id);
+  if (!existing) {
+    return res.status(404).json({ error: 'Budget not found' });
+  }
+  db.prepare('DELETE FROM budgets WHERE id = ?').run(id);
+  return res.status(200).json({ deleted: true, id });
+});
+
+// ---------- GET /categories?account_id=X ----------
+// Default suggestions plus any custom category names already used in expenses
+// or budgets for this account, so the frontend can offer them in a dropdown
+// alongside a "+ Add new category" option. 'Savings' is always included since
+// it's a built-in budget target even though it lives in a different table.
+app.get('/categories', (req, res) => {
+  const { account_id } = req.query;
+  const used = new Set(DEFAULT_SPEND_CATEGORIES);
+
+  if (account_id) {
+    db.prepare('SELECT DISTINCT category FROM expenses WHERE account_id = ?').all(account_id)
+      .forEach(r => used.add(r.category));
+    db.prepare('SELECT DISTINCT category FROM budgets WHERE account_id = ?').all(account_id)
+      .forEach(r => used.add(r.category));
+  } else {
+    db.prepare('SELECT DISTINCT category FROM expenses').all().forEach(r => used.add(r.category));
+    db.prepare('SELECT DISTINCT category FROM budgets').all().forEach(r => used.add(r.category));
+  }
+  used.delete(RESERVED_CATEGORY);
+
+  res.json({
+    spend_categories: Array.from(used).sort(),
+    reserved: RESERVED_CATEGORY
   });
 });
 
