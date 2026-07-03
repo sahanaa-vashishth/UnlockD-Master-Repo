@@ -20,14 +20,12 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    # PARTICIPANT TODO: Update the port mapping below once your backend is ready
     ports:
-      - "3000:3000"
+      - "4000:4000"
     volumes:
       - ./backend:/app
-    # Ensure backend restarts if it crashes
+      - /app/node_modules
     restart: unless-stopped
-    # PARTICIPANT TODO: (Optional) If you add a database service, uncomment the lines below so the backend configures it
     # environment:
     #   - DB_URL=jdbc:postgresql://db:5432/event_platform
     #   - DB_USER=admin
