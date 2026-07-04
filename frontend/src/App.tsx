@@ -191,20 +191,27 @@ const [chartBalanceLine, setChartBalanceLine] = useState<{ day: number; balance:
   const [chartHover, setChartHover] = useState<{ x: number; y: number; day: number; label: string } | null>(null)
     const [chartDaysInMonth, setChartDaysInMonth] = useState(30)
   const [chartAveragePerDay, setChartAveragePerDay] = useState(0)
-  const [chartLoading, setChartLoading] = useState(false)
+ const [chartLoading, setChartLoading] = useState(false)
+  const [chartBudgetSummary, setChartBudgetSummary] = useState<Budget[]>([])
 
   const loadDailyChart = useCallback(async (accountId: string, month: string) => {
     if (!accountId) return
     setChartLoading(true)
     try {
-      const res = await fetch(`${API_BASE}/analytics/daily-by-category?account_id=${accountId}&month=${month}`)
-      const data = await res.json()
-      if (res.ok) {
+      const [chartRes, budgetRes] = await Promise.all([
+        fetch(`${API_BASE}/analytics/daily-by-category?account_id=${accountId}&month=${month}`),
+        fetch(`${API_BASE}/budgets?account_id=${accountId}&month=${month}`),
+      ])
+      const data = await chartRes.json()
+      if (chartRes.ok) {
         setChartCategories(data.categories)
-       setChartBalanceLine(data.balance_line)
-        setChartSavingsLine(data.savings_line)     
-           setChartDaysInMonth(data.days_in_month)
+        setChartBalanceLine(data.balance_line)
+        setChartDaysInMonth(data.days_in_month)
         setChartAveragePerDay(data.average_per_day)
+      }
+      const budgetData = await budgetRes.json()
+      if (budgetRes.ok) {
+        setChartBudgetSummary(budgetData.budgets)
       }
     } catch {
       // silently fail — chart section will just show empty state
@@ -1946,8 +1953,9 @@ let res: Response;
         })
       }
 
-      return (
-        <div>
+     return (
+        <div style={{ display: 'flex', gap: 24, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+        <div style={{ flex: '1 1 500px', minWidth: 300 }}>
           <svg
             viewBox={`0 0 ${width} ${height}`}
             style={{ width: '100%', height: 'auto', background: '#fff', borderRadius: 8, border: '1px solid #e5e1d8', cursor: 'crosshair' }}
@@ -2050,6 +2058,38 @@ let res: Response;
             Average spend per day this month: <strong>${formatMoney(chartAveragePerDay)}</strong>
           </div>
         </div>
+
+        <div style={{ flex: '1 1 220px', minWidth: 220 }}>
+          <h3 style={{ fontSize: '0.95rem', marginTop: 0, marginBottom: 12 }}>Budget status</h3>
+          {chartBudgetSummary.length === 0 && (
+            <div className="empty-state">No budgets set for this month.</div>
+          )}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {chartBudgetSummary.map(b => {
+              const isSavings = b.category === 'Savings'
+              const statusColor = isSavings
+                ? (b.goal_reached ? '#2f7a4f' : '#b8860b')
+                : (b.over_limit ? '#b03a2e' : b.approaching_limit ? '#c9862c' : '#2f7a4f')
+              const statusText = isSavings
+                ? (b.goal_reached ? 'Goal reached' : `${b.utilization_pct}% of goal`)
+                : (b.over_limit
+                    ? `$${formatMoney(Math.abs(b.remaining))} over budget`
+                    : `$${formatMoney(b.remaining)} left`)
+              return (
+                <div key={b.id} style={{ padding: '8px 12px', border: '1px solid #e5e1d8', borderRadius: 8, fontSize: '0.85rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 600 }}>
+                    <span>{b.category}</span>
+                    <span style={{ color: statusColor }}>{statusText}</span>
+                  </div>
+                  <div style={{ color: '#888', marginTop: 2 }}>
+                    ${formatMoney(b.spent)} of ${formatMoney(b.monthly_limit)}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      </div>
       )
     })()}
   </section>
