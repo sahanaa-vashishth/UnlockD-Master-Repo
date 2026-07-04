@@ -13,8 +13,9 @@ interface Account {
 
 interface Transaction {
   id: string
-  from_account_id: string
-  to_account_id: string
+  source?: 'transaction' | 'expense' | 'savings'
+  from_account_id: string | null
+  to_account_id: string | null
   amount: number
   status: 'SUCCESS' | 'FAILED' | 'PENDING'
   failure_reason: string | null
@@ -1753,8 +1754,15 @@ const [chartBalanceLine, setChartBalanceLine] = useState<{ day: number; balance:
                         onChange={e => setEditDescription(e.target.value)}
                       />
                     </span>
-                  ) : (
+                 ) : (
                     <span className="parties">
+                      <span style={{
+                        fontSize: '0.7rem', fontWeight: 600, textTransform: 'uppercase',
+                        color: '#888', border: '1px solid #ddd', borderRadius: 4,
+                        padding: '1px 6px', marginRight: 8, display: 'inline-block'
+                      }}>
+                        {tx.source === 'expense' ? 'Expense' : tx.source === 'savings' ? 'Savings' : 'Transfer'}
+                      </span>
                       {tx.category && <strong>{tx.category}</strong>}
                       {tx.merchant && ` · ${tx.merchant}`}
                       {tx.description && ` — ${tx.description}`}
@@ -1786,23 +1794,30 @@ const [chartBalanceLine, setChartBalanceLine] = useState<{ day: number; balance:
     </div>
   ) : (
     <div style={{ display: 'flex', gap: 6 }}>
-      <button
-        type="button"
-        style={{ padding: '4px 10px', fontSize: '0.8rem', background: '#eee', border: 'none', borderRadius: 6, cursor: 'pointer' }}
-        onClick={() => startEditTx(tx)}
-      >
-        Edit
-      </button>
+      {(!tx.source || tx.source === 'transaction') && (
+        <button
+          type="button"
+          style={{ padding: '4px 10px', fontSize: '0.8rem', background: '#eee', border: 'none', borderRadius: 6, cursor: 'pointer' }}
+          onClick={() => startEditTx(tx)}
+        >
+          Edit
+        </button>
+      )}
       <button
         type="button"
         style={{ padding: '4px 10px', fontSize: '0.8rem', background: '#d9887e', color: '#b03a2e', border: 'none', borderRadius: 6, cursor: 'pointer' }}
         onClick={async () => {
+          const endpoint = tx.source === 'expense'
+            ? `${API_BASE}/expenses/${tx.id}`
+            : tx.source === 'savings'
+              ? `${API_BASE}/savings/transactions/${tx.id}`
+              : `${API_BASE}/transactions/${tx.id}`
           try {
-            const res = await fetch(`${API_BASE}/transactions/${tx.id}`, { method: 'DELETE' });
+            const res = await fetch(endpoint, { method: 'DELETE' });
             if (res.ok) {
               await runTransactionSearch();
             } else {
-              setTmMessage({ type: 'error', text: 'Could not delete transaction.' });
+              setTmMessage({ type: 'error', text: 'Could not delete this entry.' });
             }
           } catch {
             setTmMessage({ type: 'error', text: 'Could not reach server.' });

@@ -138,10 +138,10 @@ function buildTransactionQuery(query) {
     i += 2;
   }
  if (search && search.trim()) {
-    clauses.push(`(description ILIKE $${i} OR merchant ILIKE $${i + 1})`);
+    clauses.push(`(description ILIKE $${i} OR merchant ILIKE $${i + 1} OR category ILIKE $${i + 2})`);
     const like = `%${search.trim()}%`;
-    params.push(like, like);
-    i += 2;
+    params.push(like, like, like);
+    i += 3;
   }
   if (category && category.trim()) {
     clauses.push(`category ILIKE $${i}`);
@@ -180,14 +180,63 @@ function buildTransactionQuery(query) {
 }
 
 app.get('/transactions', async (req, res) => {
-  const { where, params } = buildTransactionQuery(req.query);
-  const { rows } = await q(`SELECT * FROM transactions ${where} ORDER BY created_at DESC`, params);
-  res.json(rows.map(t => ({ ...t, amount: t.amount_cents / 100 })));
+  const combined = await getAllNormalizedTransactions(req.query);
+  res.json(combined);
 });
 
+async function getAllNormalizedTransactions(query) {
+  const { account_id, q: search, category, min_amount, max_amount, start_date, end_date } = query;
+
+  const { where, params } = buildTransactionQuery(query);
+  const txRows = (await q(`SELECT * FROM transactions ${where} ORDER BY created_at DESC`, params)).rows;
+  const normalizedTx = txRows.map(t => ({
+    id: t.id, source: 'transaction', from_account_id: t.from_account_id, to_account_id: t.to_account_id,
+    amount: t.amount_cents / 100, status: t.status, created_at: t.created_at,
+    category: t.category, description: t.description, merchant: t.merchant,
+  }));
+
+  const expClauses = [];
+  const expParams = [];
+  let ei = 1;
+  if (account_id) { expClauses.push(`account_id = $${ei}`); expParams.push(account_id); ei += 1; }
+  if (search && search.trim()) { expClauses.push(`(payee ILIKE $${ei} OR category ILIKE $${ei + 1})`); expParams.push(`%${search.trim()}%`, `%${search.trim()}%`); ei += 2; }
+  if (category && category.trim()) { expClauses.push(`category ILIKE $${ei}`); expParams.push(category.trim()); ei += 1; }
+  if (min_amount !== undefined) { const c = Math.round(Number(min_amount) * 100); if (Number.isFinite(c)) { expClauses.push(`amount_cents >= $${ei}`); expParams.push(c); ei += 1; } }
+  if (max_amount !== undefined) { const c = Math.round(Number(max_amount) * 100); if (Number.isFinite(c)) { expClauses.push(`amount_cents <= $${ei}`); expParams.push(c); ei += 1; } }
+  if (start_date) { expClauses.push(`created_at >= $${ei}`); expParams.push(start_date); ei += 1; }
+  if (end_date) { expClauses.push(`created_at <= $${ei}`); expParams.push(end_date.length <= 10 ? `${end_date}T23:59:59.999Z` : end_date); ei += 1; }
+  const expWhere = expClauses.length ? `WHERE ${expClauses.join(' AND ')}` : '';
+  const expRows = (await q(`SELECT * FROM expenses ${expWhere} ORDER BY created_at DESC`, expParams)).rows;
+  const normalizedExp = expRows.map(e => ({
+    id: e.id, source: 'expense', from_account_id: e.account_id, to_account_id: null,
+    amount: e.amount_cents / 100, status: 'SUCCESS', created_at: e.created_at,
+    category: e.category, description: null, merchant: e.payee,
+  }));
+
+  const savClauses = [];
+  const savParams = [];
+  let si = 1;
+  if (account_id) { savClauses.push(`account_id = $${si}`); savParams.push(account_id); si += 1; }
+  if (category && category.trim() && category.trim().toLowerCase() !== 'savings') { savClauses.push('1 = 0'); }
+  if (min_amount !== undefined) { const c = Math.round(Number(min_amount) * 100); if (Number.isFinite(c)) { savClauses.push(`amount_cents >= $${si}`); savParams.push(c); si += 1; } }
+  if (max_amount !== undefined) { const c = Math.round(Number(max_amount) * 100); if (Number.isFinite(c)) { savClauses.push(`amount_cents <= $${si}`); savParams.push(c); si += 1; } }
+  if (start_date) { savClauses.push(`created_at >= $${si}`); savParams.push(start_date); si += 1; }
+  if (end_date) { savClauses.push(`created_at <= $${si}`); savParams.push(end_date.length <= 10 ? `${end_date}T23:59:59.999Z` : end_date); si += 1; }
+  if (search && search.trim() && !'savings'.includes(search.trim().toLowerCase())) { savClauses.push('1 = 0'); }
+  const savWhere = savClauses.length ? `WHERE ${savClauses.join(' AND ')}` : '';
+  const savRows = (await q(`SELECT * FROM savings_transactions ${savWhere} ORDER BY created_at DESC`, savParams)).rows;
+  const normalizedSav = savRows.map(s => ({
+    id: s.id, source: 'savings', from_account_id: s.type === 'CONTRIBUTE' ? s.account_id : null,
+    to_account_id: s.type === 'WITHDRAW' ? s.account_id : null,
+    amount: s.amount_cents / 100, status: 'SUCCESS', created_at: s.created_at,
+    category: 'Savings', description: s.type === 'CONTRIBUTE' ? 'Added to savings' : 'Withdrawn from savings', merchant: null,
+  }));
+
+  return [...normalizedTx, ...normalizedExp, ...normalizedSav].sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+}
+
 app.get('/transactions/export', async (req, res) => {
-  const { where, params } = buildTransactionQuery(req.query);
-  const { rows } = await q(`SELECT * FROM transactions ${where} ORDER BY created_at DESC`, params);
+  const rows = await getAllNormalizedTransactions(req.query);
 
   const escape = (val) => {
     if (val === null || val === undefined) return '';
@@ -195,13 +244,12 @@ app.get('/transactions/export', async (req, res) => {
     return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
   };
 
-  const header = ['id', 'created_at', 'from_account_id', 'to_account_id', 'amount', 'status', 'category', 'merchant', 'description'];
+  const header = ['id', 'source', 'created_at', 'from_account_id', 'to_account_id', 'amount', 'status', 'category', 'merchant', 'description'];
   const lines = [header.join(',')];
   rows.forEach(t => {
     lines.push([
-      t.id, t.created_at, t.from_account_id, t.to_account_id,
-      (t.amount_cents / 100).toFixed(2), t.status,
-      t.category, t.merchant, t.description
+      t.id, t.source, t.created_at, t.from_account_id, t.to_account_id,
+      t.amount.toFixed(2), t.status, t.category, t.merchant, t.description
     ].map(escape).join(','));
   });
 
@@ -1055,6 +1103,22 @@ app.delete('/transactions/:id', async (req, res) => {
   const existing = (await q('SELECT * FROM transactions WHERE id = $1', [id])).rows[0];
   if (!existing) return res.status(404).json({ error: 'Transaction not found' });
   await q('DELETE FROM transactions WHERE id = $1', [id]);
+  return res.status(200).json({ deleted: true, id });
+});
+
+app.delete('/expenses/:id', async (req, res) => {
+  const { id } = req.params;
+  const existing = (await q('SELECT * FROM expenses WHERE id = $1', [id])).rows[0];
+  if (!existing) return res.status(404).json({ error: 'Expense not found' });
+  await q('DELETE FROM expenses WHERE id = $1', [id]);
+  return res.status(200).json({ deleted: true, id });
+});
+
+app.delete('/savings/transactions/:id', async (req, res) => {
+  const { id } = req.params;
+  const existing = (await q('SELECT * FROM savings_transactions WHERE id = $1', [id])).rows[0];
+  if (!existing) return res.status(404).json({ error: 'Savings transaction not found' });
+  await q('DELETE FROM savings_transactions WHERE id = $1', [id]);
   return res.status(200).json({ deleted: true, id });
 });
 
