@@ -114,6 +114,7 @@ function App() {
   const [amount, setAmount] = useState('')
   const [sending, setSending] = useState(false)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [pendingUndo, setPendingUndo] = useState<{ txId: string; amount: number; secondsLeft: number } | null>(null)
   const [pinPrompt, setPinPrompt] = useState<{ accountId: string; onSuccess: () => void } | null>(null)
 const [pinInput, setPinInput] = useState('')
 const [pinError, setPinError] = useState('')
@@ -469,10 +470,10 @@ const [newAccountPin, setNewAccountPin] = useState('')
       if (!res.ok) {
         setMessage({ type: 'error', text: data.error || 'Transfer failed.' })
       } else {
-        setMessage({ type: 'success', text: `Sent $${formatMoney(Number(amount))} successfully.` })
+        setMessage(null)
+        setPendingUndo({ txId: data.id, amount: Number(amount), secondsLeft: 5 })
         setAmount('')
         setToAccountId('')
-        await loadData(activeAccountId)
       }
     } catch {
       setMessage({ type: 'error', text: 'Could not reach the server. Is the backend running?' })
@@ -480,6 +481,31 @@ const [newAccountPin, setNewAccountPin] = useState('')
       setSending(false)
     }
   }
+
+  async function handleUndoTransfer(txId: string) {
+    try {
+      await fetch(`${API_BASE}/transactions/${txId}/undo`, { method: 'POST' })
+    } finally {
+      setPendingUndo(null)
+      setMessage({ type: 'success', text: 'Transfer cancelled.' })
+      await loadData(activeAccountId)
+    }
+  }
+
+  useEffect(() => {
+    if (!pendingUndo) return
+    if (pendingUndo.secondsLeft <= 0) {
+      setPendingUndo(null)
+      setMessage({ type: 'success', text: `Sent $${formatMoney(pendingUndo.amount)} successfully.` })
+      loadData(activeAccountId)
+      return
+    }
+    const t = setTimeout(() => {
+      setPendingUndo(p => p ? { ...p, secondsLeft: p.secondsLeft - 1 } : p)
+    }, 1000)
+    return () => clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingUndo])
 
  async function handleCreateAccount(e: React.FormEvent) {
     e.preventDefault()
@@ -1851,6 +1877,27 @@ let res: Response;
     </div>
     <div id="analytics-results" className="empty-state">Select a month to see data.</div>
   </section>
+ {pendingUndo && (
+        <div style={{
+          position: 'fixed', bottom: 24, left: '50%', transform: 'translateX(-50%)',
+          background: '#222', color: '#fff', padding: '14px 20px', borderRadius: 10,
+          display: 'flex', alignItems: 'center', gap: 16, zIndex: 1100,
+          boxShadow: '0 4px 16px rgba(0,0,0,0.25)'
+        }}>
+          <span>Sent ${formatMoney(pendingUndo.amount)} — undoing in {pendingUndo.secondsLeft}s</span>
+          <button
+            type="button"
+            onClick={() => handleUndoTransfer(pendingUndo.txId)}
+            style={{
+              background: '#fff', color: '#222', border: 'none', borderRadius: 6,
+              padding: '6px 14px', fontWeight: 600, cursor: 'pointer'
+            }}
+          >
+            Undo
+          </button>
+        </div>
+      )}
+
  {pinPrompt && (
         <div style={{
           position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)',

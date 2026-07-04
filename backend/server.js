@@ -237,6 +237,47 @@ app.patch('/transactions/:id', async (req, res) => {
   const updated = (await q('SELECT * FROM transactions WHERE id = $1', [id])).rows[0];
   return res.json({ ...updated, amount: updated.amount_cents / 100 });
 });
+const UNDO_WINDOW_MS = 5000;
+const pendingTransferTimers = new Map(); // txId -> Timeout
+
+async function executeTransfer(txId, from_account_id, to_account_id, amountCents) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const current = (await client.query('SELECT status FROM transactions WHERE id = $1', [txId])).rows[0];
+    if (!current || current.status !== 'PENDING') {
+      await client.query('ROLLBACK');
+      return; // already cancelled or otherwise no longer pending
+    }
+
+    const fromAccount = (await client.query('SELECT * FROM accounts WHERE id = $1 FOR UPDATE', [from_account_id])).rows[0];
+    const toAccount = (await client.query('SELECT * FROM accounts WHERE id = $1 FOR UPDATE', [to_account_id])).rows[0];
+
+    if (!fromAccount || !toAccount) {
+      throw { code: 'NOT_FOUND', message: 'One or both accounts do not exist' };
+    }
+    if (!fromAccount.is_active || !toAccount.is_active) {
+      throw { code: 'ACCOUNT_INACTIVE', message: 'One or both accounts are disabled' };
+    }
+    if (fromAccount.balance_cents < amountCents) {
+      throw { code: 'INSUFFICIENT_FUNDS', message: 'Insufficient balance for this transfer' };
+    }
+
+    await client.query('UPDATE accounts SET balance_cents = balance_cents - $1 WHERE id = $2', [amountCents, from_account_id]);
+    await client.query('UPDATE accounts SET balance_cents = balance_cents + $1 WHERE id = $2', [amountCents, to_account_id]);
+    await client.query(`UPDATE transactions SET status = 'SUCCESS', updated_at = $1 WHERE id = $2`, [now(), txId]);
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    const reason = err.message || 'Unknown error';
+    await q(`UPDATE transactions SET status = 'FAILED', failure_reason = $1, updated_at = $2 WHERE id = $3`, [reason, now(), txId]);
+  } finally {
+    client.release();
+    pendingTransferTimers.delete(txId);
+  }
+}
 
 app.post('/transactions/transfer', async (req, res) => {
   const { from_account_id, to_account_id, amount, idempotency_key } = req.body;
@@ -263,59 +304,57 @@ app.post('/transactions/transfer', async (req, res) => {
     });
   }
 
+  const fromAccount = (await q('SELECT * FROM accounts WHERE id = $1', [from_account_id])).rows[0];
+  const toAccount = (await q('SELECT * FROM accounts WHERE id = $1', [to_account_id])).rows[0];
+  if (!fromAccount || !toAccount) {
+    return res.status(404).json({ error: 'One or both accounts do not exist' });
+  }
+  if (!fromAccount.is_active || !toAccount.is_active) {
+    return res.status(403).json({ error: 'One or both accounts are disabled' });
+  }
+  if (fromAccount.balance_cents < amountCents) {
+    return res.status(422).json({ error: 'Insufficient balance for this transfer' });
+  }
+
   const txId = uuidv4();
   const timestamp = now();
 
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
+  await q(
+    `INSERT INTO transactions (id, idempotency_key, from_account_id, to_account_id, amount_cents, status, failure_reason, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, 'PENDING', NULL, $6, $7)`,
+    [txId, idempotencyKey, from_account_id, to_account_id, amountCents, timestamp, timestamp]
+  );
 
-    await client.query(
-      `INSERT INTO transactions (id, idempotency_key, from_account_id, to_account_id, amount_cents, status, failure_reason, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, 'PENDING', NULL, $6, $7)`,
-      [txId, idempotencyKey, from_account_id, to_account_id, amountCents, timestamp, timestamp]
-    );
+  const timer = setTimeout(() => {
+    executeTransfer(txId, from_account_id, to_account_id, amountCents);
+  }, UNDO_WINDOW_MS);
+  pendingTransferTimers.set(txId, timer);
 
-    const fromAccount = (await client.query('SELECT * FROM accounts WHERE id = $1 FOR UPDATE', [from_account_id])).rows[0];
-    const toAccount = (await client.query('SELECT * FROM accounts WHERE id = $1 FOR UPDATE', [to_account_id])).rows[0];
-
-    if (!fromAccount || !toAccount) {
-      throw { code: 'NOT_FOUND', message: 'One or both accounts do not exist' };
-    }
-    if (!fromAccount.is_active || !toAccount.is_active) {
-      throw { code: 'ACCOUNT_INACTIVE', message: 'One or both accounts are disabled' };
-    }
-    if (fromAccount.balance_cents < amountCents) {
-      throw { code: 'INSUFFICIENT_FUNDS', message: 'Insufficient balance for this transfer' };
-    }
-
-    await client.query('UPDATE accounts SET balance_cents = balance_cents - $1 WHERE id = $2', [amountCents, from_account_id]);
-    await client.query('UPDATE accounts SET balance_cents = balance_cents + $1 WHERE id = $2', [amountCents, to_account_id]);
-    await client.query(`UPDATE transactions SET status = 'SUCCESS', updated_at = $1 WHERE id = $2`, [now(), txId]);
-
-    await client.query('COMMIT');
-
-    const created = (await q('SELECT * FROM transactions WHERE id = $1', [txId])).rows[0];
-    return res.status(201).json({ ...created, amount: created.amount_cents / 100 });
-  } catch (err) {
-    await client.query('ROLLBACK');
-
-    const reason = err.message || 'Unknown error';
-    if (err.code === 'NOT_FOUND') {
-      await q('DELETE FROM transactions WHERE id = $1', [txId]);
-    } else {
-      await q(`UPDATE transactions SET status = 'FAILED', failure_reason = $1, updated_at = $2 WHERE id = $3`, [reason, now(), txId]);
-    }
-    const statusCode = err.code === 'NOT_FOUND' ? 404
-      : err.code === 'INSUFFICIENT_FUNDS' ? 422
-      : err.code === 'ACCOUNT_INACTIVE' ? 403
-      : 500;
-    return res.status(statusCode).json({ error: reason });
-  } finally {
-    client.release();
-  }
+  const created = (await q('SELECT * FROM transactions WHERE id = $1', [txId])).rows[0];
+  return res.status(201).json({
+    ...created,
+    amount: created.amount_cents / 100,
+    undoable: true,
+    undo_window_ms: UNDO_WINDOW_MS
+  });
 });
 
+app.post('/transactions/:id/undo', async (req, res) => {
+  const { id } = req.params;
+
+  const timer = pendingTransferTimers.get(id);
+  if (!timer) {
+    return res.status(409).json({ error: 'This transaction can no longer be undone' });
+  }
+
+  clearTimeout(timer);
+  pendingTransferTimers.delete(id);
+
+  await q(`UPDATE transactions SET status = 'CANCELLED', updated_at = $1 WHERE id = $2`, [now(), id]);
+
+  const updated = (await q('SELECT * FROM transactions WHERE id = $1', [id])).rows[0];
+  return res.json({ ...updated, amount: updated.amount_cents / 100 });
+});
 // ================== EXPENSES (Feature 2) ==================
 
 app.get('/expenses', async (req, res) => {

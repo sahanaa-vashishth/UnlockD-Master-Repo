@@ -27,8 +27,7 @@ async function init() {
       from_account_id TEXT NOT NULL,
       to_account_id TEXT NOT NULL,
       amount_cents INTEGER NOT NULL,
-      status TEXT NOT NULL CHECK(status IN ('PENDING','SUCCESS','FAILED')),
-      failure_reason TEXT,
+      status TEXT NOT NULL CHECK(status IN ('PENDING','SUCCESS','FAILED','CANCELLED')),      failure_reason TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       category TEXT,
@@ -91,8 +90,9 @@ async function init() {
   await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS pin TEXT NOT NULL DEFAULT '0000';`);
   await pool.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS category TEXT;`);
   await pool.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS description TEXT;`);
-  await pool.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS merchant TEXT;`);
-
+await pool.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS merchant TEXT;`);
+  await pool.query(`ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_status_check;`);
+  await pool.query(`ALTER TABLE transactions ADD CONSTRAINT transactions_status_check CHECK (status IN ('PENDING','SUCCESS','FAILED','CANCELLED'));`);
   // Seed two demo accounts if empty, so you can test transfers immediately.
   const { rows } = await pool.query('SELECT COUNT(*)::int AS c FROM accounts');
   if (rows[0].c === 0) {
