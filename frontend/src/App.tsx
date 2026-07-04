@@ -183,6 +183,39 @@ const [newAccountPin, setNewAccountPin] = useState('')
   const [payMessage, setPayMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
   // ---- Transaction Management (Feature 4) ----
+  // ---- Daily spend-by-category + balance chart ----
+  const [chartMonth, setChartMonth] = useState<string>(currentMonthValue())
+  const [chartCategories, setChartCategories] = useState<{ category: string; daily: { day: number; total: number }[] }[]>([])
+const [chartBalanceLine, setChartBalanceLine] = useState<{ day: number; balance: number }[]>([])
+  const [chartSavingsLine, setChartSavingsLine] = useState<{ day: number; savings: number }[]>([])
+  const [chartHover, setChartHover] = useState<{ x: number; y: number; day: number; label: string } | null>(null)
+    const [chartDaysInMonth, setChartDaysInMonth] = useState(30)
+  const [chartAveragePerDay, setChartAveragePerDay] = useState(0)
+  const [chartLoading, setChartLoading] = useState(false)
+
+  const loadDailyChart = useCallback(async (accountId: string, month: string) => {
+    if (!accountId) return
+    setChartLoading(true)
+    try {
+      const res = await fetch(`${API_BASE}/analytics/daily-by-category?account_id=${accountId}&month=${month}`)
+      const data = await res.json()
+      if (res.ok) {
+        setChartCategories(data.categories)
+       setChartBalanceLine(data.balance_line)
+        setChartSavingsLine(data.savings_line)     
+           setChartDaysInMonth(data.days_in_month)
+        setChartAveragePerDay(data.average_per_day)
+      }
+    } catch {
+      // silently fail — chart section will just show empty state
+    } finally {
+      setChartLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (activeAccountId) loadDailyChart(activeAccountId, chartMonth)
+  }, [activeAccountId, chartMonth, loadDailyChart])
   const [tmSearch, setTmSearch] = useState('')
   const [tmCategory, setTmCategory] = useState('')
   const [tmMinAmount, setTmMinAmount] = useState('')
@@ -1838,44 +1871,187 @@ let res: Response;
   </section>
 
   <section className="ledger-section" style={{ marginTop: 24 }}>
-    <h2>Spending by merchant</h2>
+    <h2>Daily spending by category</h2>
     <div style={{ display: 'flex', gap: 12, marginBottom: 16 }}>
       <div className="field" style={{ flex: 1, minWidth: 180 }}>
-        <label htmlFor="analytics-month">Month</label>
+        <label htmlFor="chart-month">Month</label>
         <input
-          id="analytics-month"
+          id="chart-month"
           type="month"
-          defaultValue={currentMonthValue()}
-          onChange={async (e) => {
-            const month = e.currentTarget.value;
-            try {
-              const res = await fetch(`${API_BASE}/analytics/spending?account_id=${activeAccountId}&month=${month}`);
-              const data = await res.json();
-              if (res.ok) {
-                const total = data.total_spending;
-                const html = data.by_merchant.length === 0
-                  ? '<div class="empty-state">No spending this month.</div>'
-                  : `<div style="display:flex;flex-direction:column;gap:12px;">${data.by_merchant.map((m: any) => `
-                    <div style="padding:10px 14px;border:1px solid #e5e1d8;border-radius:8px;">
-                      <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
-                        <strong>${m.merchant}</strong>
-                        <span>$${m.total.toFixed(2)} (${m.count}x)</span>
-                      </div>
-                      <div style="background:#eee;border-radius:4px;height:8px;">
-                        <div style="width:${(m.total/total)*100}%;background:#2f7a4f;height:100%;"></div>
-                      </div>
-                    </div>
-                  `).join('')}</div>`;
-                document.getElementById('analytics-results')!.innerHTML = html;
-              }
-            } catch {
-              document.getElementById('analytics-results')!.innerHTML = '<div class="empty-state">Could not load data.</div>';
-            }
-          }}
+          value={chartMonth}
+          onChange={e => setChartMonth(e.target.value)}
         />
       </div>
     </div>
-    <div id="analytics-results" className="empty-state">Select a month to see data.</div>
+
+    {chartLoading && <div className="empty-state">Loading chart…</div>}
+
+    {!chartLoading && chartCategories.length === 0 && chartBalanceLine.length === 0 && (
+      <div className="empty-state">No activity this month.</div>
+    )}
+
+    {!chartLoading && (chartCategories.length > 0 || chartBalanceLine.length > 0) && (() => {
+      const COLORS = ['#c0392b', '#2980b9', '#27ae60', '#8e44ad', '#d68910', '#16a085', '#e91e63', '#5d6d7e']
+      const width = 700
+      const height = 340
+      const padding = { top: 20, right: 20, bottom: 40, left: 65 }
+      const plotW = width - padding.left - padding.right
+      const plotH = height - padding.top - padding.bottom
+
+      const allValues = [
+        ...chartCategories.flatMap(c => c.daily.map(d => d.total)),
+        ...chartBalanceLine.map(d => d.balance),
+        ...chartSavingsLine.map(d => d.savings),
+        0,
+      ]
+      const minVal = Math.min(...allValues)
+      const maxVal = Math.max(1, ...allValues)
+
+      const xForDay = (day: number) => padding.left + ((day - 1) / Math.max(1, chartDaysInMonth - 1)) * plotW
+      const yForVal = (val: number) => padding.top + plotH - ((val - minVal) / (maxVal - minVal || 1)) * plotH
+      const dayForX = (x: number) => {
+        const frac = (x - padding.left) / plotW
+        return Math.round(frac * (chartDaysInMonth - 1)) + 1
+      }
+
+      const linePath = (points: { x: number; y: number }[]) =>
+        points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ')
+
+      const yTicks = [0, 0.25, 0.5, 0.75, 1].map(f => minVal + (maxVal - minVal) * f)
+      const xTickDays = Array.from({ length: chartDaysInMonth }, (_, i) => i + 1)
+        .filter(d => d === 1 || d % 5 === 0 || d === chartDaysInMonth)
+
+      function handleMove(e: React.MouseEvent<SVGSVGElement>) {
+        const svg = e.currentTarget
+        const rect = svg.getBoundingClientRect()
+        const scaleX = width / rect.width
+        const mouseX = (e.clientX - rect.left) * scaleX
+        const day = Math.min(chartDaysInMonth, Math.max(1, dayForX(mouseX)))
+
+        const parts: string[] = []
+        chartCategories.forEach(cat => {
+          const point = cat.daily.find(d => d.day === day)
+          if (point) parts.push(`${cat.category}: $${formatMoney(point.total)}`)
+        })
+        const balPoint = chartBalanceLine.find(d => d.day === day)
+        if (balPoint) parts.push(`Balance: $${formatMoney(balPoint.balance)}`)
+        const savPoint = chartSavingsLine.find(d => d.day === day)
+        if (savPoint) parts.push(`Savings: $${formatMoney(savPoint.savings)}`)
+
+        setChartHover({
+          x: xForDay(day),
+          y: padding.top,
+          day,
+          label: `Day ${day} — ${parts.join(' · ')}`
+        })
+      }
+
+      return (
+        <div>
+          <svg
+            viewBox={`0 0 ${width} ${height}`}
+            style={{ width: '100%', height: 'auto', background: '#fff', borderRadius: 8, border: '1px solid #e5e1d8', cursor: 'crosshair' }}
+            onMouseMove={handleMove}
+            onMouseLeave={() => setChartHover(null)}
+          >
+            {yTicks.map((val, i) => (
+              <g key={i}>
+                <line
+                  x1={padding.left}
+                  x2={width - padding.right}
+                  y1={yForVal(val)}
+                  y2={yForVal(val)}
+                  stroke="#eee"
+                  strokeWidth={1}
+                />
+                <text x={padding.left - 8} y={yForVal(val) + 4} textAnchor="end" fontSize="10" fill="#888">
+                  ${Math.round(val)}
+                </text>
+              </g>
+            ))}
+
+            {xTickDays.map(day => (
+              <text key={day} x={xForDay(day)} y={height - padding.bottom + 16} textAnchor="middle" fontSize="10" fill="#888">
+                {day}
+              </text>
+            ))}
+
+            {chartCategories.map((cat, i) => (
+              <path
+                key={cat.category}
+                d={linePath(cat.daily.map(d => ({ x: xForDay(d.day), y: yForVal(d.total) })))}
+                fill="none"
+                stroke={COLORS[i % COLORS.length]}
+                strokeWidth={2}
+              />
+            ))}
+
+            {chartBalanceLine.length > 0 && (
+              <path
+                d={linePath(chartBalanceLine.map(d => ({ x: xForDay(d.day), y: yForVal(d.balance) })))}
+                fill="none"
+                stroke="#222"
+                strokeWidth={2}
+                strokeDasharray="5,4"
+              />
+            )}
+
+            {chartSavingsLine.length > 0 && (
+              <path
+                d={linePath(chartSavingsLine.map(d => ({ x: xForDay(d.day), y: yForVal(d.savings) })))}
+                fill="none"
+                stroke="#b8860b"
+                strokeWidth={2}
+                strokeDasharray="2,3"
+              />
+            )}
+
+            {chartHover && (
+              <line
+                x1={chartHover.x}
+                x2={chartHover.x}
+                y1={padding.top}
+                y2={height - padding.bottom}
+                stroke="#999"
+                strokeWidth={1}
+                strokeDasharray="3,3"
+              />
+            )}
+          </svg>
+
+          {chartHover && (
+            <div style={{ marginTop: 8, fontSize: '0.8rem', background: '#fafafa', border: '1px solid #eee', borderRadius: 6, padding: '6px 10px', display: 'inline-block' }}>
+              {chartHover.label}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, marginTop: 12, fontSize: '0.85rem' }}>
+            {chartCategories.map((cat, i) => (
+              <div key={cat.category} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ width: 12, height: 12, borderRadius: 3, background: COLORS[i % COLORS.length], display: 'inline-block' }} />
+                {cat.category} (cumulative)
+              </div>
+            ))}
+            {chartBalanceLine.length > 0 && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ width: 12, height: 2, background: '#222', display: 'inline-block' }} />
+                Account balance
+              </div>
+            )}
+            {chartSavingsLine.length > 0 && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ width: 12, height: 2, background: '#b8860b', display: 'inline-block' }} />
+                Savings balance
+              </div>
+            )}
+          </div>
+
+          <div style={{ marginTop: 12, fontSize: '0.9rem', color: '#666' }}>
+            Average spend per day this month: <strong>${formatMoney(chartAveragePerDay)}</strong>
+          </div>
+        </div>
+      )
+    })()}
   </section>
  {pendingUndo && (
         <div style={{

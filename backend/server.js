@@ -137,14 +137,14 @@ function buildTransactionQuery(query) {
     params.push(account_id, account_id);
     i += 2;
   }
-  if (search && search.trim()) {
-    clauses.push(`(description LIKE $${i} OR merchant LIKE $${i + 1})`);
+ if (search && search.trim()) {
+    clauses.push(`(description ILIKE $${i} OR merchant ILIKE $${i + 1})`);
     const like = `%${search.trim()}%`;
     params.push(like, like);
     i += 2;
   }
   if (category && category.trim()) {
-    clauses.push(`category = $${i}`);
+    clauses.push(`category ILIKE $${i}`);
     params.push(category.trim());
     i += 1;
   }
@@ -873,7 +873,158 @@ app.post('/import/transactions', async (req, res) => {
 
   return res.status(200).json({ imported: imported.length, errors, data: imported });
 });
+app.get('/analytics/daily-by-category', async (req, res) => {
+  const { account_id, month } = req.query;
+  if (!account_id) return res.status(400).json({ error: 'account_id is required' });
 
+  let monthPrefix = currentMonthPrefix();
+  if (month !== undefined) {
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
+      return res.status(400).json({ error: 'month must be in YYYY-MM format' });
+    }
+    monthPrefix = month;
+  }
+
+  const [y, m] = monthPrefix.split('-').map(Number);
+  const daysInMonth = new Date(y, m, 0).getDate();
+  const monthStart = `${monthPrefix}-01T00:00:00.000Z`;
+  const monthEnd = `${monthPrefix}-${String(daysInMonth).padStart(2, '0')}T23:59:59.999Z`;
+
+  // ---- Category spend lines (from expenses AND categorized outgoing transactions) ----
+  const expenseRows = (await q(
+    `SELECT category, created_at, amount_cents FROM expenses
+     WHERE account_id = $1 AND created_at LIKE $2`,
+    [account_id, `${monthPrefix}%`]
+  )).rows;
+
+  const txCategoryRows = (await q(
+    `SELECT COALESCE(category, merchant, 'Uncategorized') AS category, created_at, amount_cents
+     FROM transactions
+     WHERE from_account_id = $1 AND created_at LIKE $2 AND status = 'SUCCESS'`,
+    [account_id, `${monthPrefix}%`]
+  )).rows;
+
+  const combinedRows = [...expenseRows, ...txCategoryRows];
+  const categories = Array.from(new Set(combinedRows.map(r => r.category))).sort();
+
+  const series = {};
+  categories.forEach(cat => {
+    series[cat] = new Array(daysInMonth + 1).fill(0); // index 1..daysInMonth
+  });
+  combinedRows.forEach(r => {
+    const day = new Date(r.created_at).getDate();
+    series[r.category][day] += Number(r.amount_cents) / 100;
+  });
+
+  const categoryResult = categories.map(cat => {
+    let running = 0;
+    const daily = series[cat].slice(1).map((total, idx) => {
+      running += total;
+      return { day: idx + 1, total: running };
+    });
+    return { category: cat, daily };
+  });
+
+const totalSpending = combinedRows.reduce((sum, r) => sum + Number(r.amount_cents), 0) / 100;
+  const averagePerDay = totalSpending / daysInMonth;
+
+  // ---- Running balance line ----
+  // Starting balance = current balance minus every net effect of transactions
+  // and expenses that happened during/after the month start, walked backwards.
+  const account = (await q('SELECT balance_cents FROM accounts WHERE id = $1', [account_id])).rows[0];
+  if (!account) return res.status(404).json({ error: 'Account not found' });
+
+  // All balance-affecting events in this account this month, in chronological order.
+  const txRows = (await q(
+    `SELECT created_at,
+            CASE WHEN from_account_id = $1 THEN -amount_cents ELSE amount_cents END AS delta_cents
+     FROM transactions
+     WHERE (from_account_id = $1 OR to_account_id = $1) AND status = 'SUCCESS' AND created_at BETWEEN $2 AND $3`,
+    [account_id, monthStart, monthEnd]
+  )).rows;
+
+  const expenseDeltaRows = (await q(
+    `SELECT created_at, -amount_cents AS delta_cents FROM expenses
+     WHERE account_id = $1 AND created_at BETWEEN $2 AND $3`,
+    [account_id, monthStart, monthEnd]
+  )).rows;
+
+  // Everything that happened AFTER this month (to subtract back out from current balance
+  // to find what the balance was at the start of this month).
+  const laterTxRows = (await q(
+    `SELECT CASE WHEN from_account_id = $1 THEN -amount_cents ELSE amount_cents END AS delta_cents
+     FROM transactions
+     WHERE (from_account_id = $1 OR to_account_id = $1) AND status = 'SUCCESS' AND created_at > $2`,
+    [account_id, monthEnd]
+  )).rows;
+  const laterExpenseRows = (await q(
+    `SELECT -amount_cents AS delta_cents FROM expenses WHERE account_id = $1 AND created_at > $2`,
+    [account_id, monthEnd]
+  )).rows;
+  const laterSavingsRows = (await q(
+    `SELECT CASE WHEN type = 'CONTRIBUTE' THEN -amount_cents ELSE amount_cents END AS delta_cents
+     FROM savings_transactions WHERE account_id = $1 AND created_at > $2`,
+    [account_id, monthEnd]
+  )).rows;
+
+  const monthSavingsRows = (await q(
+    `SELECT created_at, CASE WHEN type = 'CONTRIBUTE' THEN -amount_cents ELSE amount_cents END AS delta_cents
+     FROM savings_transactions WHERE account_id = $1 AND created_at BETWEEN $2 AND $3`,
+    [account_id, monthStart, monthEnd]
+  )).rows;
+
+  const sumDeltas = rowsArr => rowsArr.reduce((sum, r) => sum + Number(r.delta_cents), 0);
+  const laterDeltaCents = sumDeltas(laterTxRows) + sumDeltas(laterExpenseRows) + sumDeltas(laterSavingsRows);
+
+  // Balance at the very start of this month = current balance - everything that happened
+  // during this month - everything that happened after this month.
+  const monthDeltaCents = sumDeltas(txRows) + sumDeltas(expenseDeltaRows) + sumDeltas(monthSavingsRows);
+  const startOfMonthBalanceCents = account.balance_cents - monthDeltaCents - laterDeltaCents;
+
+  // Walk forward day by day, applying that day's events, to build the running balance line.
+  const events = [
+    ...txRows.map(r => ({ day: new Date(r.created_at).getDate(), delta: Number(r.delta_cents) })),
+    ...expenseDeltaRows.map(r => ({ day: new Date(r.created_at).getDate(), delta: Number(r.delta_cents) })),
+    ...monthSavingsRows.map(r => ({ day: new Date(r.created_at).getDate(), delta: Number(r.delta_cents) })),
+  ];
+  const deltaByDay = new Array(daysInMonth + 1).fill(0);
+  events.forEach(e => { deltaByDay[e.day] += e.delta; });
+
+  const balanceLine = [];
+  let running = startOfMonthBalanceCents;
+  for (let day = 1; day <= daysInMonth; day++) {
+    running += deltaByDay[day];
+    balanceLine.push({ day, balance: running / 100 });
+  }
+
+  const laterSavingsDeltaCents = sumDeltas(laterSavingsRows); // main-balance perspective (negative = contributed)
+  const monthSavingsDeltaCents = sumDeltas(monthSavingsRows); // main-balance perspective
+  const startOfMonthSavingsCents = account.savings_balance_cents + monthSavingsDeltaCents + laterSavingsDeltaCents;
+
+  const savingsDeltaByDay = new Array(daysInMonth + 1).fill(0);
+  monthSavingsRows.forEach(r => {
+    const day = new Date(r.created_at).getDate();
+    // Flip sign: monthSavingsRows delta is from the main-balance perspective (negative = contributed to savings).
+    savingsDeltaByDay[day] += -Number(r.delta_cents) / 100;
+  });
+
+  const savingsLine = [];
+  let runningSavings = startOfMonthSavingsCents / 100;
+  for (let day = 1; day <= daysInMonth; day++) {
+    runningSavings += savingsDeltaByDay[day];
+    savingsLine.push({ day, savings: runningSavings });
+  }
+
+  return res.json({
+    month: monthPrefix,
+    days_in_month: daysInMonth,
+    categories: categoryResult,
+    balance_line: balanceLine,
+    savings_line: savingsLine,
+    total_spending: totalSpending,
+    average_per_day: averagePerDay
+  });
+});
 app.get('/analytics/spending', async (req, res) => {
   const { account_id, month } = req.query;
   if (!account_id) return res.status(400).json({ error: 'account_id is required' });
